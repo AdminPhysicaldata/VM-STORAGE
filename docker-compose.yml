@@ -6,7 +6,7 @@ services:
     container_name: sftp
     restart: always
     ports:
-      - "22:22"
+      - "2222:22"
     volumes:
       - sessions_data:/home/${SFTP_USER}/sessions
     command: "${SFTP_USER}:${SFTP_PASS}:1000:1000:sessions"
