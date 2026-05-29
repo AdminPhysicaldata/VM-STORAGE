@@ -16,6 +16,23 @@ services:
       timeout: 5s
       retries: 3
 
+  nfs:
+    image: erichough/nfs-server:2.2.1
+    container_name: nfs-server
+    restart: always
+    ports:
+      - "2049:2049"
+    volumes:
+      - sessions_data:/data/sessions:ro
+    environment:
+      NFS_EXPORT_0: '/data/sessions *(ro,sync,no_subtree_check,no_root_squash,insecure)'
+    privileged: true
+    healthcheck:
+      test: ["CMD", "sh", "-c", "ss -tlnp | grep ':2049'"]
+      interval: 30s
+      timeout: 5s
+      retries: 3
+
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.50.0
     container_name: cadvisor-storage
