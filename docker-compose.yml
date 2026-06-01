@@ -9,6 +9,7 @@ services:
       - "2222:22"
     volumes:
       - sessions_data:/home/${SFTP_USER}/sessions
+      - ./sftp-setup.sh:/etc/sftp.d/fix-perms.sh:ro
     command: "${SFTP_USER}:${SFTP_PASS}:1000:1000:sessions"
     healthcheck:
       test: ["CMD", "sh", "-c", "ss -tlnp | grep ':22'"]
