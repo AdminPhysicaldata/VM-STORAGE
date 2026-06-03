@@ -1,0 +1,2 @@
+0 9  * * * root /usr/local/bin/python /app/SessionsToMistral.py /data/sessions >> /proc/1/fd/1 2>&1
+0 21 * * * root /usr/local/bin/python /app/SessionsToMistral.py /data/sessions >> /proc/1/fd/1 2>&1

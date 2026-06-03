@@ -22,6 +22,9 @@ DODGE_FILE = "uploaded_sessions.json"
 MISTRAL_CLIENT_ID   = os.environ.get("DELIVERY_CLIENT_ID",   "mistral")
 MISTRAL_CLIENT_NAME = os.environ.get("DELIVERY_CLIENT_NAME", "Mistral AI")
 
+# Limite de volume par exécution (défaut 5 Go, surchargeable via MAX_RUN_GB)
+MAX_RUN_BYTES = int(os.environ.get("MAX_RUN_GB", "5")) * 1024 ** 3
+
 # Files that alone do not constitute a meaningful session
 METADATA_ONLY_FILES = {"metadata.json"}
 
@@ -168,6 +171,18 @@ def db_mark_delivery_failed(session_id: str) -> None:
         logging.info("  DB: %s → delivery_failed", session_id)
     except Exception as exc:
         logging.error("  DB erreur (mark_delivery_failed) : %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Directory size
+# ---------------------------------------------------------------------------
+
+def get_dir_size(path: Path) -> int:
+    """Total size in bytes of all files under path."""
+    try:
+        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
+    except Exception:
+        return 0
 
 
 # ---------------------------------------------------------------------------
@@ -394,13 +409,26 @@ def main() -> None:
         else:
             valid_sessions.append(s)
 
-    to_send = [s for s in valid_sessions if s.name not in already_done]
+    pending = [s for s in valid_sessions if s.name not in already_done]
     skipped = [s.name for s in valid_sessions if s.name in already_done]
+
+    # --- Plafond de volume par exécution ---
+    to_send: list[Path] = []
+    capped: list[tuple[str, int]] = []   # (name, size_bytes) des sessions non prises
+    cumul_bytes = 0
+    for s in pending:
+        size = get_dir_size(s)
+        if cumul_bytes + size > MAX_RUN_BYTES:
+            capped.append((s.name, size))
+        else:
+            to_send.append(s)
+            cumul_bytes += size
 
     print(f"{len(all_sessions)} session(s) trouvée(s) au total :")
     print(f"  {len(empty_sessions)} vide(s) — ignorées")
     print(f"  {len(skipped)} déjà envoyée(s) — ignorées")
-    print(f"  {len(to_send)} à envoyer")
+    print(f"  {len(capped)} reportée(s) — plafond {format_size(MAX_RUN_BYTES)} atteint")
+    print(f"  {len(to_send)} à envoyer ({format_size(cumul_bytes)})")
 
     if empty_sessions:
         print("\nSessions vides :")
@@ -409,6 +437,10 @@ def main() -> None:
 
     if skipped:
         print(f"\nIgnorées (dodge) : {skipped}")
+    if capped:
+        print(f"\nReportées au prochain run (plafond {format_size(MAX_RUN_BYTES)}) :")
+        for name, size in capped:
+            print(f"  REPORT  {name}  ({format_size(size)})")
     print()
 
     if not to_send:
@@ -450,6 +482,8 @@ def main() -> None:
         print(f"  ECHEC  {name}")
     for name, reason in empty_sessions:
         print(f"  VIDE   {name}  ({reason})")
+    for name, size in capped:
+        print(f"  REPORT {name}  ({format_size(size)}) — sera envoyé au prochain run")
 
     print()
     print("=== Cumul total envoyé (toutes exécutions) ===")
