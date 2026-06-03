@@ -35,6 +35,28 @@ services:
       timeout: 5s
       retries: 3
 
+  sessions-uploader:
+    build:
+      context: ./sessions-uploader
+      dockerfile: Dockerfile
+    container_name: sessions-uploader
+    restart: always
+    volumes:
+      - sessions_data:/data/sessions
+      - sessions_envoye_data:/data/session_envoye
+    environment:
+      POSTGRES_HOST: ${VM_DATA_IP}
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+    entrypoint: >
+      sh -c "while true; do
+        python /app/SessionsToMistral.py /data/sessions;
+        echo '--- sleeping 300s ---';
+        sleep 300;
+      done"
+
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.50.0
     container_name: cadvisor-storage
@@ -56,6 +78,12 @@ volumes:
       type: none
       o: bind
       device: ${SESSIONS_PATH}
+  sessions_envoye_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SESSIONS_ENVOYE_PATH}
 
 networks:
   default:
