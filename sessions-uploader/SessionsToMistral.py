@@ -174,44 +174,41 @@ def db_mark_delivery_failed(session_id: str) -> None:
 
 
 # ---------------------------------------------------------------------------
-# Directory size
+# Session analysis — single rglob pass (size + empty check)
 # ---------------------------------------------------------------------------
 
-def get_dir_size(path: Path) -> int:
-    """Total size in bytes of all files under path."""
-    try:
-        return sum(f.stat().st_size for f in path.rglob("*") if f.is_file())
-    except Exception:
-        return 0
-
-
-# ---------------------------------------------------------------------------
-# Empty session detection
-# ---------------------------------------------------------------------------
-
-def is_session_empty(session_dir: Path) -> tuple[bool, str]:
+def analyze_session(session_dir: Path) -> tuple[bool, str, int]:
     """
-    Returns (is_empty, reason).
-    A session is considered empty when it has no data files beyond metadata.json,
-    or when all data files add up to 0 bytes.
+    Single directory traversal.
+    Returns (is_empty, reason, total_bytes).
     """
     try:
         all_files = [f for f in session_dir.rglob("*") if f.is_file()]
     except Exception as exc:
-        return True, f"impossible de lister les fichiers : {exc}"
+        return True, f"impossible de lister les fichiers : {exc}", 0
 
     if not all_files:
-        return True, "dossier vide"
+        return True, "dossier vide", 0
 
-    data_files = [f for f in all_files if f.name.lower() not in METADATA_ONLY_FILES]
-    if not data_files:
-        return True, "uniquement metadata.json, pas de données"
+    total_bytes = 0
+    data_bytes = 0
+    data_count = 0
+    for f in all_files:
+        try:
+            size = f.stat().st_size
+        except OSError:
+            size = 0
+        total_bytes += size
+        if f.name.lower() not in METADATA_ONLY_FILES:
+            data_bytes += size
+            data_count += 1
 
-    total_data_bytes = sum(f.stat().st_size for f in data_files)
-    if total_data_bytes == 0:
-        return True, f"{len(data_files)} fichier(s) de données mais tous vides (0 octet)"
+    if data_count == 0:
+        return True, "uniquement metadata.json, pas de données", 0
+    if data_bytes == 0:
+        return True, f"{data_count} fichier(s) de données mais tous vides (0 octet)", 0
 
-    return False, ""
+    return False, "", total_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -393,41 +390,48 @@ def main() -> None:
     dodge = load_dodge(root)
     already_done = {e["name"] for e in dodge["sessions"]}
 
+    print(f"Lecture de '{root}'...", flush=True)
     all_sessions = sorted(p for p in root.iterdir() if p.is_dir() and p.name.lower().startswith("session"))
 
     if not all_sessions:
-        print(f"Aucun dossier 'session*' trouvé dans '{root}'")
+        print(f"Aucun dossier 'session*' trouvé dans '{root}'", flush=True)
         sys.exit(0)
 
-    # --- Filtrage : sessions vides et déjà envoyées ---
-    empty_sessions = []
-    valid_sessions = []
-    for s in all_sessions:
-        empty, reason = is_session_empty(s)
-        if empty:
-            empty_sessions.append((s.name, reason))
-        else:
-            valid_sessions.append(s)
+    # Sessions déjà envoyées : on les saute sans les analyser
+    skipped = [s.name for s in all_sessions if s.name in already_done]
+    candidates = [s for s in all_sessions if s.name not in already_done]
 
-    pending = [s for s in valid_sessions if s.name not in already_done]
-    skipped = [s.name for s in valid_sessions if s.name in already_done]
+    print(f"{len(all_sessions)} dossier(s) dont {len(skipped)} déjà envoyé(s). "
+          f"Analyse de {len(candidates)} candidat(s)...", flush=True)
 
-    # --- Plafond de volume par exécution ---
-    to_send: list[Path] = []
-    capped: list[tuple[str, int]] = []   # (name, size_bytes) des sessions non prises
+    # --- Analyse au fil de l'eau : on s'arrête dès que le quota est atteint ---
+    empty_sessions: list[tuple[str, str]] = []
+    to_send: list[tuple[Path, int]] = []
+    capped_count = 0
     cumul_bytes = 0
-    for s in pending:
-        size = get_dir_size(s)
-        if cumul_bytes + size > MAX_RUN_BYTES:
-            capped.append((s.name, size))
+
+    for s in candidates:
+        if cumul_bytes >= MAX_RUN_BYTES:
+            capped_count += 1
+            continue
+
+        print(f"  Analyse {s.name} ...", end="\r", flush=True)
+        is_empty, reason, size = analyze_session(s)
+
+        if is_empty:
+            empty_sessions.append((s.name, reason))
+        elif cumul_bytes + size > MAX_RUN_BYTES:
+            capped_count += 1
         else:
-            to_send.append(s)
+            to_send.append((s, size))
             cumul_bytes += size
 
-    print(f"{len(all_sessions)} session(s) trouvée(s) au total :")
+    print(" " * 60, end="\r", flush=True)
+
+    print(f"{len(all_sessions)} session(s) trouvée(s) au total :", flush=True)
     print(f"  {len(empty_sessions)} vide(s) — ignorées")
     print(f"  {len(skipped)} déjà envoyée(s) — ignorées")
-    print(f"  {len(capped)} reportée(s) — plafond {format_size(MAX_RUN_BYTES)} atteint")
+    print(f"  {capped_count} non analysée(s) — plafond {format_size(MAX_RUN_BYTES)} atteint")
     print(f"  {len(to_send)} à envoyer ({format_size(cumul_bytes)})")
 
     if empty_sessions:
@@ -437,23 +441,21 @@ def main() -> None:
 
     if skipped:
         print(f"\nIgnorées (dodge) : {skipped}")
-    if capped:
-        print(f"\nReportées au prochain run (plafond {format_size(MAX_RUN_BYTES)}) :")
-        for name, size in capped:
-            print(f"  REPORT  {name}  ({format_size(size)})")
-    print()
+    if capped_count:
+        print(f"\n{capped_count} session(s) non analysée(s) — seront traitées aux prochains runs.")
+    print(flush=True)
 
     if not to_send:
-        print("Aucune session à envoyer.")
+        print("Aucune session à envoyer.", flush=True)
     else:
         with tempfile.TemporaryDirectory() as tmp_dir:
-            for i, session_dir in enumerate(to_send, 1):
+            for i, (session_dir, _) in enumerate(to_send, 1):
                 session_id = session_dir.name
-                print(f"[{i}/{len(to_send)}] '{session_id}'")
+                print(f"[{i}/{len(to_send)}] '{session_id}'", flush=True)
 
                 zip_path = zip_session(session_dir, Path(tmp_dir))
                 zip_size = zip_path.stat().st_size
-                print(f"  Archive : {zip_path.name}  ({format_size(zip_size)})")
+                print(f"  Archive : {zip_path.name}  ({format_size(zip_size)})", flush=True)
 
                 db_start_delivery(session_id, zip_size)
 
@@ -467,13 +469,14 @@ def main() -> None:
                 else:
                     db_mark_delivery_failed(session_id)
 
-                print()
+                print(flush=True)
 
     # --- Résumé global depuis le dodge file ---
     total_bytes = sum(e["size_bytes"] for e in dodge["sessions"])
     total_seconds = sum(e["duration_seconds"] for e in dodge["sessions"])
     sent_this_run = [e for e in dodge["sessions"] if e["name"] not in already_done]
-    failed_this_run = [s.name for s in to_send if s.name not in {e["name"] for e in dodge["sessions"]}]
+    sent_names = {e["name"] for e in dodge["sessions"]}
+    failed_this_run = [s.name for s, _ in to_send if s.name not in sent_names]
 
     print("=== Résumé de cette exécution ===")
     for e in sent_this_run:
@@ -482,8 +485,8 @@ def main() -> None:
         print(f"  ECHEC  {name}")
     for name, reason in empty_sessions:
         print(f"  VIDE   {name}  ({reason})")
-    for name, size in capped:
-        print(f"  REPORT {name}  ({format_size(size)}) — sera envoyé au prochain run")
+    if capped_count:
+        print(f"  REPORT {capped_count} session(s) non analysée(s) — prochains runs")
 
     print()
     print("=== Cumul total envoyé (toutes exécutions) ===")
