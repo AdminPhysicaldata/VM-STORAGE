@@ -50,6 +50,8 @@ services:
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      DELIVERY_CLIENT_ID: ${DELIVERY_CLIENT_ID:-mistral}
+      DELIVERY_CLIENT_NAME: ${DELIVERY_CLIENT_NAME:-Mistral AI}
     entrypoint: >
       sh -c "while true; do
         python /app/SessionsToMistral.py /data/sessions;

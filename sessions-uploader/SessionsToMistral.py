@@ -18,6 +18,10 @@ PASSWORD = "sqiu763hQP1"
 
 DODGE_FILE = "uploaded_sessions.json"
 
+# Client Mistral dans la BDD — configurable via env
+MISTRAL_CLIENT_ID   = os.environ.get("DELIVERY_CLIENT_ID",   "mistral")
+MISTRAL_CLIENT_NAME = os.environ.get("DELIVERY_CLIENT_NAME", "Mistral AI")
+
 # Files that alone do not constitute a meaningful session
 METADATA_ONLY_FILES = {"metadata.json"}
 
@@ -41,39 +45,84 @@ def _now():
     return datetime.now(timezone.utc)
 
 
-def db_mark_delivering(session_id: str, size_bytes: int) -> bool:
-    """Transition captured/treatment_done/qa_accepted/delivery_pending → delivering."""
+def db_ensure_client(cur) -> None:
+    """Crée le client Mistral s'il n'existe pas encore."""
+    cur.execute("""
+        INSERT INTO clients (client_id, name)
+        VALUES (%s, %s)
+        ON CONFLICT (client_id) DO NOTHING
+    """, (MISTRAL_CLIENT_ID, MISTRAL_CLIENT_NAME))
+
+
+def db_start_delivery(session_id: str, size_bytes: int) -> bool:
+    """
+    Passe la session en 'delivering' et crée/met à jour l'entrée client_deliveries.
+    Appelé juste avant l'upload.
+    """
+    now = _now()
+    try:
+        conn = _pg_connect()
+        with conn:
+            with conn.cursor() as cur:
+                # Récupérer project_id et duration de la session
+                cur.execute(
+                    "SELECT project_id, duration_seconds FROM sessions WHERE session_id = %s",
+                    (session_id,),
+                )
+                row = cur.fetchone()
+                if not row:
+                    logging.warning("  DB: session '%s' introuvable", session_id)
+                    return False
+                project_id, duration_seconds = row
+
+                db_ensure_client(cur)
+
+                delivery_id = f"del_{session_id}_{MISTRAL_CLIENT_ID}"
+                cur.execute("""
+                    INSERT INTO client_deliveries
+                        (delivery_id, client_id, session_id, project_id,
+                         status, started_at, size_bytes, duration_seconds)
+                    VALUES (%s, %s, %s, %s, 'delivering', %s, %s, %s)
+                    ON CONFLICT (client_id, session_id) DO UPDATE
+                        SET status = 'delivering', started_at = %s
+                """, (delivery_id, MISTRAL_CLIENT_ID, session_id, project_id,
+                      now, size_bytes, duration_seconds, now))
+
+                cur.execute("""
+                    UPDATE sessions
+                    SET pipeline_status     = 'delivering',
+                        delivering_at       = COALESCE(delivering_at, %s),
+                        delivery_pending_at = COALESCE(delivery_pending_at, %s),
+                        client_id           = %s,
+                        size_bytes          = COALESCE(size_bytes, %s)
+                    WHERE session_id = %s
+                """, (now, now, MISTRAL_CLIENT_ID, size_bytes, session_id))
+
+        conn.close()
+        logging.info("  DB: %s → delivering (client: %s)", session_id, MISTRAL_CLIENT_ID)
+        return True
+    except Exception as exc:
+        logging.error("  DB erreur (start_delivery) : %s", exc)
+        return False
+
+
+def db_confirm_delivered(session_id: str, size_bytes: int, duration_seconds: float) -> bool:
+    """
+    Marque la session et la livraison client comme 'delivered'.
+    Appelé après upload réussi.
+    """
+    now = _now()
+    delivery_id = f"del_{session_id}_{MISTRAL_CLIENT_ID}"
     try:
         conn = _pg_connect()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
-                    UPDATE sessions
-                    SET pipeline_status    = 'delivering',
-                        delivering_at      = COALESCE(delivering_at, %s),
-                        delivery_pending_at= COALESCE(delivery_pending_at, %s),
-                        size_bytes         = COALESCE(size_bytes, %s)
-                    WHERE session_id = %s
-                    RETURNING session_id
-                """, (_now(), _now(), size_bytes, session_id))
-                updated = cur.fetchone() is not None
-        conn.close()
-        if updated:
-            logging.info("  DB: %s → delivering", session_id)
-        else:
-            logging.warning("  DB: session '%s' introuvable, statut non mis à jour", session_id)
-        return updated
-    except Exception as exc:
-        logging.error("  DB erreur (mark_delivering) : %s", exc)
-        return False
+                    UPDATE client_deliveries
+                    SET status = 'delivered', delivered_at = %s
+                    WHERE delivery_id = %s
+                """, (now, delivery_id))
 
-
-def db_mark_delivered(session_id: str, size_bytes: int, duration_seconds: float) -> bool:
-    """Marque la session comme livrée."""
-    try:
-        conn = _pg_connect()
-        with conn:
-            with conn.cursor() as cur:
                 cur.execute("""
                     UPDATE sessions
                     SET pipeline_status  = 'delivered',
@@ -82,31 +131,39 @@ def db_mark_delivered(session_id: str, size_bytes: int, duration_seconds: float)
                         duration_seconds = COALESCE(duration_seconds, %s)
                     WHERE session_id = %s
                     RETURNING session_id
-                """, (_now(), size_bytes, duration_seconds or None, session_id))
+                """, (now, size_bytes, duration_seconds or None, session_id))
                 updated = cur.fetchone() is not None
+
         conn.close()
         if updated:
-            logging.info("  DB: %s → delivered", session_id)
+            logging.info("  DB: %s → delivered (client: %s)", session_id, MISTRAL_CLIENT_ID)
         else:
-            logging.warning("  DB: session '%s' introuvable", session_id)
+            logging.warning("  DB: session '%s' introuvable lors de la confirmation", session_id)
         return updated
     except Exception as exc:
-        logging.error("  DB erreur (mark_delivered) : %s", exc)
+        logging.error("  DB erreur (confirm_delivered) : %s", exc)
         return False
 
 
 def db_mark_delivery_failed(session_id: str) -> None:
-    """Marque la session comme échouée."""
+    """Marque la session et la livraison client comme 'delivery_failed'."""
+    now = _now()
+    delivery_id = f"del_{session_id}_{MISTRAL_CLIENT_ID}"
     try:
         conn = _pg_connect()
         with conn:
             with conn.cursor() as cur:
                 cur.execute("""
+                    UPDATE client_deliveries
+                    SET status = 'failed', error_msg = 'Upload Mistral échoué'
+                    WHERE delivery_id = %s
+                """, (delivery_id,))
+                cur.execute("""
                     UPDATE sessions
-                    SET pipeline_status  = 'delivery_failed',
+                    SET pipeline_status    = 'delivery_failed',
                         delivery_failed_at = %s
                     WHERE session_id = %s
-                """, (_now(), session_id))
+                """, (now, session_id))
         conn.close()
         logging.info("  DB: %s → delivery_failed", session_id)
     except Exception as exc:
@@ -366,13 +423,13 @@ def main() -> None:
                 zip_size = zip_path.stat().st_size
                 print(f"  Archive : {zip_path.name}  ({format_size(zip_size)})")
 
-                db_mark_delivering(session_id, zip_size)
+                db_start_delivery(session_id, zip_size)
 
                 success = upload_zip_to_mistral(str(zip_path))
 
                 if success:
                     duration = read_duration(session_dir)
-                    db_mark_delivered(session_id, zip_size, duration)
+                    db_confirm_delivered(session_id, zip_size, duration)
                     mark_uploaded(root, dodge, session_id, zip_size, duration)
                     move_session_to_sent(session_dir, sent_dir)
                 else:
