@@ -57,6 +57,42 @@ def db_ensure_client(cur) -> None:
     """, (MISTRAL_CLIENT_ID, MISTRAL_CLIENT_NAME))
 
 
+def db_resolve_session_id(folder_name: str) -> str | None:
+    """
+    Retourne le session_id DB correspondant au dossier NAS.
+
+    La colonne session_folder (ex: 'session_20260604_002349') permet de relier
+    le nom de dossier NAS à l'ID DB (ex: 'sess_20260604_002351_ab8e4d39').
+    Fallback : si la session est directement enregistrée avec le nom de dossier.
+    """
+    try:
+        conn = _pg_connect()
+        with conn:
+            with conn.cursor() as cur:
+                # 1. Lookup par session_folder (cas normal — IDs sess_*)
+                cur.execute(
+                    "SELECT session_id FROM sessions WHERE session_folder = %s LIMIT 1",
+                    (folder_name,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+
+                # 2. Lookup direct — session enregistrée avec le nom de dossier comme ID
+                cur.execute(
+                    "SELECT session_id FROM sessions WHERE session_id = %s LIMIT 1",
+                    (folder_name,),
+                )
+                row = cur.fetchone()
+                if row:
+                    return row[0]
+
+        conn.close()
+    except Exception as exc:
+        logging.warning("  DB: impossible de résoudre session_id pour '%s': %s", folder_name, exc)
+    return None
+
+
 def db_start_delivery(session_id: str, size_bytes: int) -> bool:
     """
     Passe la session en 'delivering' et crée/met à jour l'entrée client_deliveries.
@@ -67,7 +103,6 @@ def db_start_delivery(session_id: str, size_bytes: int) -> bool:
         conn = _pg_connect()
         with conn:
             with conn.cursor() as cur:
-                # Récupérer project_id et duration de la session
                 cur.execute(
                     "SELECT project_id, duration_seconds FROM sessions WHERE session_id = %s",
                     (session_id,),
@@ -171,6 +206,27 @@ def db_mark_delivery_failed(session_id: str) -> None:
         logging.info("  DB: %s → delivery_failed", session_id)
     except Exception as exc:
         logging.error("  DB erreur (mark_delivery_failed) : %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Analysis.json — vérification des erreurs de capture
+# ---------------------------------------------------------------------------
+
+def read_analysis_errors(session_dir: Path) -> list[str]:
+    """
+    Lit analysis.json et retourne la liste des erreurs.
+    Retourne [] si le fichier est absent, illisible, ou sans erreurs.
+    """
+    analysis_path = session_dir / "analysis.json"
+    if not analysis_path.exists():
+        return []
+    try:
+        data = json.loads(analysis_path.read_text(encoding="utf-8"))
+        errors = data.get("errors", [])
+        return [str(e) for e in errors] if errors else []
+    except Exception as exc:
+        logging.warning("  Impossible de lire analysis.json pour '%s': %s", session_dir.name, exc)
+        return []
 
 
 # ---------------------------------------------------------------------------
@@ -376,14 +432,22 @@ def zip_session(session_dir: Path, tmp_dir: Path) -> Path:
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    if len(sys.argv) < 2:
-        print("Usage: python SessionsToMistral.py <dossier_racine>")
-        sys.exit(1)
+    import argparse
+    parser = argparse.ArgumentParser(description="Upload sessions to Mistral")
+    parser.add_argument("dossier", help="Dossier racine contenant les sessions")
+    parser.add_argument("--dry-run", action="store_true",
+                        help="Analyse et affiche ce qui serait envoyé, sans rien uploader ni déplacer")
+    args = parser.parse_args()
 
-    root = Path(sys.argv[1])
+    dry_run = args.dry_run
+    root = Path(args.dossier)
+
     if not root.is_dir():
         print(f"Erreur : '{root}' n'est pas un dossier valide")
         sys.exit(1)
+
+    if dry_run:
+        print("*** MODE DRY-RUN — aucun upload, aucun déplacement, aucune écriture DB ***\n")
 
     sent_dir = root.parent / "session_envoye"
 
@@ -405,10 +469,11 @@ def main() -> None:
           f"Analyse de {len(candidates)} candidat(s)...", flush=True)
 
     # --- Analyse au fil de l'eau : on s'arrête dès que le quota est atteint ---
-    empty_sessions: list[tuple[str, str]] = []
-    to_send: list[tuple[Path, int]] = []
+    empty_sessions:    list[tuple[str, str]]       = []
+    rejected_sessions: list[tuple[str, list[str]]] = []
+    to_send:           list[tuple[Path, int]]       = []
     capped_count = 0
-    cumul_bytes = 0
+    cumul_bytes  = 0
 
     for s in candidates:
         if cumul_bytes >= MAX_RUN_BYTES:
@@ -416,8 +481,15 @@ def main() -> None:
             continue
 
         print(f"  Analyse {s.name} ...", end="\r", flush=True)
-        is_empty, reason, size = analyze_session(s)
 
+        # 1. Vérifier analysis.json — ignorer si des erreurs sont présentes
+        errors = read_analysis_errors(s)
+        if errors:
+            rejected_sessions.append((s.name, errors))
+            continue
+
+        # 2. Vérifier que la session n'est pas vide
+        is_empty, reason, size = analyze_session(s)
         if is_empty:
             empty_sessions.append((s.name, reason))
         elif cumul_bytes + size > MAX_RUN_BYTES:
@@ -430,9 +502,17 @@ def main() -> None:
 
     print(f"{len(all_sessions)} session(s) trouvée(s) au total :", flush=True)
     print(f"  {len(empty_sessions)} vide(s) — ignorées")
+    print(f"  {len(rejected_sessions)} rejetée(s) — erreurs analysis.json")
     print(f"  {len(skipped)} déjà envoyée(s) — ignorées")
     print(f"  {capped_count} non analysée(s) — plafond {format_size(MAX_RUN_BYTES)} atteint")
     print(f"  {len(to_send)} à envoyer ({format_size(cumul_bytes)})")
+
+    if rejected_sessions:
+        print("\nSessions rejetées (erreurs analysis.json) :")
+        for name, errs in rejected_sessions:
+            print(f"  REJET  {name}")
+            for e in errs:
+                print(f"         - {e}")
 
     if empty_sessions:
         print("\nSessions vides :")
@@ -447,29 +527,54 @@ def main() -> None:
 
     if not to_send:
         print("Aucune session à envoyer.", flush=True)
+    elif dry_run:
+        print("\nSessions qui seraient envoyées :")
+        for i, (session_dir, size) in enumerate(to_send, 1):
+            folder_name = session_dir.name
+            db_session_id = db_resolve_session_id(folder_name)
+            duration = read_duration(session_dir)
+            print(f"  [{i}/{len(to_send)}] {folder_name}  ({format_size(size)}, {format_duration(duration)})")
+            if db_session_id:
+                print(f"           DB → {db_session_id}")
+            else:
+                print(f"           DB → introuvable (upload sans mise à jour DB)")
     else:
         with tempfile.TemporaryDirectory() as tmp_dir:
             for i, (session_dir, _) in enumerate(to_send, 1):
-                session_id = session_dir.name
-                print(f"[{i}/{len(to_send)}] '{session_id}'", flush=True)
+                folder_name = session_dir.name
+                print(f"[{i}/{len(to_send)}] '{folder_name}'", flush=True)
+
+                # Résoudre le session_id DB (peut différer du nom de dossier NAS)
+                db_session_id = db_resolve_session_id(folder_name)
+                if db_session_id:
+                    print(f"  DB session_id : {db_session_id}", flush=True)
+                else:
+                    print(f"  Avertissement : session '{folder_name}' introuvable en DB — upload sans mise à jour DB", flush=True)
 
                 zip_path = zip_session(session_dir, Path(tmp_dir))
                 zip_size = zip_path.stat().st_size
                 print(f"  Archive : {zip_path.name}  ({format_size(zip_size)})", flush=True)
 
-                db_start_delivery(session_id, zip_size)
+                if db_session_id:
+                    db_start_delivery(db_session_id, zip_size)
 
                 success = upload_zip_to_mistral(str(zip_path))
 
                 if success:
                     duration = read_duration(session_dir)
-                    db_confirm_delivered(session_id, zip_size, duration)
-                    mark_uploaded(root, dodge, session_id, zip_size, duration)
+                    if db_session_id:
+                        db_confirm_delivered(db_session_id, zip_size, duration)
+                    mark_uploaded(root, dodge, folder_name, zip_size, duration)
                     move_session_to_sent(session_dir, sent_dir)
                 else:
-                    db_mark_delivery_failed(session_id)
+                    if db_session_id:
+                        db_mark_delivery_failed(db_session_id)
 
                 print(flush=True)
+
+    if dry_run:
+        print("\n*** DRY-RUN terminé — rien n'a été modifié ***")
+        sys.exit(0)
 
     # --- Résumé global depuis le dodge file ---
     total_bytes = sum(e["size_bytes"] for e in dodge["sessions"])
@@ -483,6 +588,8 @@ def main() -> None:
         print(f"  OK     {e['name']}  ({format_size(e['size_bytes'])}, {format_duration(e['duration_seconds'])})")
     for name in failed_this_run:
         print(f"  ECHEC  {name}")
+    for name, errs in rejected_sessions:
+        print(f"  REJET  {name}  ({len(errs)} erreur(s) : {errs[0]}{'…' if len(errs) > 1 else ''})")
     for name, reason in empty_sessions:
         print(f"  VIDE   {name}  ({reason})")
     if capped_count:

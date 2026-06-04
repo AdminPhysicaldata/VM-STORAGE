@@ -1,0 +1,39 @@
+{
+  "sessions": [
+    {
+      "name": "session_20260603_093016",
+      "size_bytes": 34646774,
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "session_20260603_093043",
+      "size_bytes": 74665054,
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "session_20260603_093346",
+      "size_bytes": 63052098,
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "session_20260603_093451",
+      "size_bytes": 65774498,
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "session_20260603_152311",
+      "size_bytes": 78741404,
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "session_20260603_152341",
+      "size_bytes": 26825687,
+      "duration_seconds": 0.0
+    },
+    {
+      "name": "session_20260603_152348",
+      "size_bytes": 18222598,
+      "duration_seconds": 0.0
+    }
+  ]
+}

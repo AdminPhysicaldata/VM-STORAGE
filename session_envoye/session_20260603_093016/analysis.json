@@ -1,0 +1,111 @@
+{
+  "session": "/home/pc-00002/Desktop/operatorv2/data/2026-06-03_09-30-16_000149",
+  "errors": [],
+  "warnings": [
+    "kernel dropped 172 frame(s) on head (V4L2 sequence counter gaps)",
+    "incremental drift on head: -62.3 ms/min",
+    "kernel dropped 165 frame(s) on left (V4L2 sequence counter gaps)",
+    "incremental drift on left: -62.3 ms/min",
+    "kernel dropped 139 frame(s) on right (V4L2 sequence counter gaps)",
+    "incremental drift on right: -53.0 ms/min"
+  ],
+  "disk_check": {
+    "total_bytes": 501809635328,
+    "used_bytes": 275105968128,
+    "free_bytes": 201137864704,
+    "free_ratio": 0.4008250351201993
+  },
+  "fps_check": {
+    "cameras": {
+      "head": {
+        "expected_fps": 120.0,
+        "measured_fps": 124.98298519026193,
+        "duration_sec": 25.964691877365112,
+        "low_fps_seconds": [],
+        "sequence_gaps": 172,
+        "queue_drops": 2659
+      },
+      "left": {
+        "expected_fps": 120.0,
+        "measured_fps": 124.98298519026193,
+        "duration_sec": 25.964693069458008,
+        "low_fps_seconds": [],
+        "sequence_gaps": 165,
+        "queue_drops": 2663
+      },
+      "right": {
+        "expected_fps": 120.0,
+        "measured_fps": 124.97181336034801,
+        "duration_sec": 25.968714952468872,
+        "low_fps_seconds": [],
+        "sequence_gaps": 139,
+        "queue_drops": 2682
+      }
+    }
+  },
+  "sensor_check": {
+    "sensors": {
+      "right": {
+        "expected_hz": 60.0,
+        "measured_hz": 62.5,
+        "duration_sec": 25.960214614868164,
+        "ouverture_constant": null,
+        "ouverture_min_mm": null,
+        "ouverture_max_mm": null
+      },
+      "left": {
+        "expected_hz": 60.0,
+        "measured_hz": 62.5,
+        "duration_sec": 25.94677448272705,
+        "ouverture_constant": null,
+        "ouverture_min_mm": null,
+        "ouverture_max_mm": null
+      }
+    }
+  },
+  "sync_check": {
+    "camera_duration_sec": {
+      "head": 25.964691877365112,
+      "left": 25.964693069458008,
+      "right": 25.968714952468872
+    },
+    "sensor_duration_sec": {
+      "right": 25.960214614868164,
+      "left": 25.94677448272705
+    },
+    "camera_duration_median_sec": 25.964693069458008,
+    "sensor_duration_median_sec": 25.953494548797607,
+    "delta_sec": 0.01119852066040039,
+    "ok": true
+  },
+  "drift_check": {
+    "streams": {
+      "head": {
+        "drift_ms_per_min": -62.27,
+        "status": "incremental"
+      },
+      "left": {
+        "drift_ms_per_min": -62.27,
+        "status": "incremental"
+      },
+      "right": {
+        "drift_ms_per_min": -52.98,
+        "status": "incremental"
+      }
+    },
+    "pairs": {
+      "head:left": {
+        "relative_drift_ms_per_min": -0.0,
+        "status": "stable"
+      },
+      "head:right": {
+        "relative_drift_ms_per_min": -9.29,
+        "status": "stable"
+      },
+      "left:right": {
+        "relative_drift_ms_per_min": -9.28,
+        "status": "stable"
+      }
+    }
+  }
+}

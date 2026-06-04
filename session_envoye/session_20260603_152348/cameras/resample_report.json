@@ -1,0 +1,15 @@
+{
+  "t0": 1780489431.1415975,
+  "t_end": 1780489444.8225105,
+  "duration_sec": 13.680912971496582,
+  "grid_points": 410,
+  "output_fps": 30.0,
+  "accepted": 410,
+  "rejected_no_frame": 0,
+  "rejected_spread": 0,
+  "spread_ms_p50": 4.031,
+  "spread_ms_p95": 7.995,
+  "spread_ms_max": 8.726,
+  "spread_ms_mean": 4.338,
+  "accepted_duration_sec": 13.666667
+}
