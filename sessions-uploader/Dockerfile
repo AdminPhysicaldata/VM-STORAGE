@@ -5,12 +5,15 @@ RUN apt-get update \
     && apt-get install -y --no-install-recommends cron \
     && rm -rf /var/lib/apt/lists/*
 
-RUN pip install --no-cache-dir requests psycopg2-binary
+RUN pip install --no-cache-dir requests psycopg2-binary kafka-python
 
 WORKDIR /app
 COPY SessionsToMistral.py .
+COPY SessionsToMail.py .
+COPY SessionsWatcher.py .
+COPY StorageHeartbeat.py .
 
-COPY crontab /etc/cron.d/sessions-uploader
+COPY cronjobs/crontab /etc/cron.d/sessions-uploader
 RUN chmod 0644 /etc/cron.d/sessions-uploader
 
 COPY entrypoint.sh /entrypoint.sh

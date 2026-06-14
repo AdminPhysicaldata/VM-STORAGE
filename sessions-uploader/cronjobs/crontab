@@ -1,0 +1,1 @@
+0 10 * * * root /usr/local/bin/python /app/SessionsToMistral.py /data/sessions --max-sessions 100 >> /proc/1/fd/1 2>&1

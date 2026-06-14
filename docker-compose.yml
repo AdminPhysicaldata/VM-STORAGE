@@ -11,9 +11,10 @@ services:
       - "2222:22"
     volumes:
       - sessions_data:/home/${SFTP_USER}/sessions
+      - ./sftp-keys:/home/${SFTP_USER}/.ssh/keys:ro
     command: "${SFTP_USER}:${SFTP_PASS}:1000:1000:sessions"
     healthcheck:
-      test: ["CMD", "sh", "-c", "ss -tlnp | grep ':22'"]
+      test: ["CMD", "pgrep", "sshd"]
       interval: 30s
       timeout: 5s
       retries: 3
@@ -21,37 +22,67 @@ services:
   nfs:
     image: erichough/nfs-server:2.2.1
     container_name: nfs-server
-    restart: always
+    restart: "no"
     network_mode: host
     volumes:
-      - sessions_data:/data/sessions:ro
+      - ${SESSIONS_PATH}:/data/sessions:ro
     environment:
-      NFS_EXPORT_0: '/data/sessions *(ro,sync,no_subtree_check,no_root_squash,insecure)'
+      NFS_EXPORT_0: '/data/sessions *(ro,sync,no_subtree_check,no_root_squash,insecure,fsid=0)'
       NFS_DISABLE_VERSION_3: '1'
     privileged: true
     healthcheck:
-      test: ["CMD", "sh", "-c", "ss -tlnp | grep ':2049'"]
+      test: ["CMD", "sh", "-c", "pgrep rpc.mountd >/dev/null"]
       interval: 30s
       timeout: 5s
       retries: 3
 
-  sessions-uploader:
+  # sessions-uploader:
+  #   build:
+  #     context: ./sessions-uploader
+  #     dockerfile: Dockerfile
+  #   container_name: sessions-uploader
+  #   restart: always
+  #   volumes:
+  #     - sessions_data:/data/sessions
+  #     - sessions_envoye_data:/data/session_envoye
+  #   environment:
+  #     POSTGRES_HOST: ${VM_DATA_IP}
+  #     POSTGRES_PORT: "5432"
+  #     POSTGRES_DB: ${POSTGRES_DB}
+  #     POSTGRES_USER: ${POSTGRES_USER}
+  #     POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+  #     DELIVERY_CLIENT_ID: ${DELIVERY_CLIENT_ID:-mistral}
+  #     DELIVERY_CLIENT_NAME: ${DELIVERY_CLIENT_NAME:-Mistral AI}
+  #     BACKEND_URL: http://${VM_BACKEND_IP}:5000
+  #     INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+  #     SMTP_HOST: ${SMTP_HOST:-smtp.gmail.com}
+  #     SMTP_PORT: ${SMTP_PORT:-587}
+  #     SMTP_USER: ${SMTP_USER}
+  #     SMTP_PASS: ${SMTP_PASS}
+  #     SMTP_SENDER: ${SMTP_SENDER:-${SMTP_USER}}
+  #     MAX_ATTACH_MB: ${MAX_ATTACH_MB:-200}
+  #     KAFKA_BROKER: ${KAFKA_BROKER:-${VM_DATA_IP}:9092}
+  #     SERVER_ID: ${SERVER_ID:-vm-storage}
+  #     HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-60}
+
+  fs-scanner:
+    platform: linux/amd64
     build:
-      context: ./sessions-uploader
-      dockerfile: Dockerfile
-    container_name: sessions-uploader
+      context: .
+      dockerfile: fs-scanner/Dockerfile
+    container_name: fs-scanner
     restart: always
     volumes:
-      - sessions_data:/data/sessions
-      - sessions_envoye_data:/data/session_envoye
+      - sessions_data:/data/sessions:ro
     environment:
+      SESSIONS_DIR: /data/sessions
       POSTGRES_HOST: ${VM_DATA_IP}
       POSTGRES_PORT: "5432"
       POSTGRES_DB: ${POSTGRES_DB}
       POSTGRES_USER: ${POSTGRES_USER}
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      DELIVERY_CLIENT_ID: ${DELIVERY_CLIENT_ID:-mistral}
-      DELIVERY_CLIENT_NAME: ${DELIVERY_CLIENT_NAME:-Mistral AI}
+      SCAN_INTERVAL: ${FS_SCANNER_INTERVAL:-15}
+      STABILITY_SECONDS: ${FS_SCANNER_STABILITY:-60}
 
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.50.0

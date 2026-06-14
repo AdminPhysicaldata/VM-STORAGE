@@ -1,13 +1,26 @@
+"""
+SessionsToMistral.py — Envoie les sessions complètes/valides vers Mistral.
+
+Pipeline en continu : un pool de processus (ANALYZE_PROCESSES) analyse les
+candidats au fil de l'eau (pas de passe d'analyse complète préalable), et un
+pool de threads (UPLOAD_WORKERS) envoie les sessions valides dès qu'elles
+sont prêtes. Les sessions invalides/rejetées/vides sont persistées dans le
+fichier de dodge dès leur analyse, pour ne jamais être ré-analysées.
+"""
+
+from __future__ import annotations
+
 import json
 import logging
 import os
 import shutil
 import sys
 import tempfile
-from datetime import datetime, timezone
+import zipfile
+from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from multiprocessing import cpu_count
 from pathlib import Path
 
-import psycopg2
 import requests
 
 logging.basicConfig(level=logging.INFO)
@@ -15,6 +28,10 @@ logging.basicConfig(level=logging.INFO)
 BASE_URL = "http://13.62.206.125:5001"
 USERNAME = "pd_umi"
 PASSWORD = "sqiu763hQP1"
+
+# Backend interne (API pipeline) — pour marquer les sessions comme envoyées
+BACKEND_URL        = os.environ.get("BACKEND_URL", "https://slouchy-trombone-bats.ngrok-free.dev/api")
+INTERNAL_API_TOKEN = os.environ.get("INTERNAL_API_TOKEN", "b1445bb1f44ca2ae6dab11a11cbd62b41805e02726b49c4f9e87199011176970")
 
 DODGE_FILE = "uploaded_sessions.json"
 
@@ -28,184 +45,243 @@ MAX_RUN_BYTES = int(os.environ.get("MAX_RUN_GB", "5")) * 1024 ** 3
 # Files that alone do not constitute a meaningful session
 METADATA_ONLY_FILES = {"metadata.json"}
 
+# Parallélisme — analyse (validation/intégrité) : multiprocessing, l'I/O
+# (rglob, lecture JSON) domine et est répartie sur plusieurs processus
+ANALYZE_PROCESSES = int(os.environ.get("ANALYZE_PROCESSES", str(min(4, max(1, cpu_count() or 1)))))
+
+# Parallélisme — envoi (zip + upload réseau) : threads, l'I/O réseau libère le GIL
+UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "3"))
+
 
 # ---------------------------------------------------------------------------
-# PostgreSQL
+# Backend API
 # ---------------------------------------------------------------------------
 
-def _pg_connect():
-    return psycopg2.connect(
-        host=os.environ.get("POSTGRES_HOST", "postgresql"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
-        dbname=os.environ.get("POSTGRES_DB", "robotics"),
-        user=os.environ.get("POSTGRES_USER", "robotics"),
-        password=os.environ.get("POSTGRES_PASSWORD", "robotics123"),
-        connect_timeout=10,
-    )
-
-
-def _now():
-    return datetime.now(timezone.utc)
-
-
-def db_ensure_client(cur) -> None:
-    """Crée le client Mistral s'il n'existe pas encore."""
-    cur.execute("""
-        INSERT INTO clients (client_id, name)
-        VALUES (%s, %s)
-        ON CONFLICT (client_id) DO NOTHING
-    """, (MISTRAL_CLIENT_ID, MISTRAL_CLIENT_NAME))
-
-
-def db_resolve_session_id(folder_name: str) -> str | None:
+def db_register_session(session_dir: Path) -> str | None:
     """
-    Retourne le session_id DB correspondant au dossier NAS.
+    Enregistre/relie la session en BDD via le backend, comme le fait
+    sftp_scanner.py (résolution ou création, scoring depuis analysis.json,
+    mise à jour session_folder/size_bytes/quality_score/pipeline_status).
 
-    La colonne session_folder (ex: 'session_20260604_002349') permet de relier
-    le nom de dossier NAS à l'ID DB (ex: 'sess_20260604_002351_ab8e4d39').
-    Fallback : si la session est directement enregistrée avec le nom de dossier.
+    Lit analysis.json (requis) et config.json (optionnel, pour la création
+    si la session n'existe pas encore en BDD). Retourne le session_id DB,
+    ou None en cas d'échec / analysis.json manquant.
     """
+    analysis_path = session_dir / "analysis.json"
+    if not analysis_path.exists():
+        return None
+
     try:
-        conn = _pg_connect()
-        with conn:
-            with conn.cursor() as cur:
-                # 1. Lookup par session_folder (cas normal — IDs sess_*)
-                cur.execute(
-                    "SELECT session_id FROM sessions WHERE session_folder = %s LIMIT 1",
-                    (folder_name,),
-                )
-                row = cur.fetchone()
-                if row:
-                    return row[0]
-
-                # 2. Lookup direct — session enregistrée avec le nom de dossier comme ID
-                cur.execute(
-                    "SELECT session_id FROM sessions WHERE session_id = %s LIMIT 1",
-                    (folder_name,),
-                )
-                row = cur.fetchone()
-                if row:
-                    return row[0]
-
-        conn.close()
+        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
     except Exception as exc:
-        logging.warning("  DB: impossible de résoudre session_id pour '%s': %s", folder_name, exc)
+        logging.warning("  Impossible de lire analysis.json pour '%s': %s", session_dir.name, exc)
+        return None
+
+    config = None
+    config_path = session_dir / "config.json"
+    if config_path.exists():
+        try:
+            config = json.loads(config_path.read_text(encoding="utf-8"))
+        except Exception:
+            config = None
+
+    mission = None
+    mission_path = session_dir / "mission.json"
+    if mission_path.exists():
+        try:
+            mission = json.loads(mission_path.read_text(encoding="utf-8"))
+        except Exception:
+            mission = None
+
+    size_bytes = sum(f.stat().st_size for f in session_dir.rglob("*") if f.is_file())
+
+    try:
+        r = requests.post(
+            f"{BACKEND_URL}/pipeline/sessions/register",
+            json={
+                "folder_name": session_dir.name,
+                "analysis": analysis,
+                "config": config,
+                "mission": mission,
+                "size_bytes": size_bytes,
+            },
+            headers=_backend_headers(),
+            timeout=15,
+        )
+        if r.status_code == 200:
+            return r.json().get("session_id")
+        logging.warning("  Backend erreur (register) [%s]: %s", r.status_code, r.text)
+    except requests.RequestException as exc:
+        logging.warning("  Backend: impossible d'enregistrer la session '%s': %s", session_dir.name, exc)
     return None
 
 
-def db_start_delivery(session_id: str, size_bytes: int) -> bool:
+def _backend_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if INTERNAL_API_TOKEN:
+        headers["X-Internal-Token"] = INTERNAL_API_TOKEN
+    return headers
+
+
+def api_mark_sent(session_ref: str, size_bytes: int, duration_seconds: float) -> bool:
     """
-    Passe la session en 'delivering' et crée/met à jour l'entrée client_deliveries.
-    Appelé juste avant l'upload.
+    Appelle le backend pour marquer la session comme envoyée au client Mistral.
+    'session_ref' : session_id DB ou nom de dossier NAS (session_folder).
     """
-    now = _now()
     try:
-        conn = _pg_connect()
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute(
-                    "SELECT project_id, duration_seconds FROM sessions WHERE session_id = %s",
-                    (session_id,),
-                )
-                row = cur.fetchone()
-                if not row:
-                    logging.warning("  DB: session '%s' introuvable", session_id)
-                    return False
-                project_id, duration_seconds = row
-
-                db_ensure_client(cur)
-
-                delivery_id = f"del_{session_id}_{MISTRAL_CLIENT_ID}"
-                cur.execute("""
-                    INSERT INTO client_deliveries
-                        (delivery_id, client_id, session_id, project_id,
-                         status, started_at, size_bytes, duration_seconds)
-                    VALUES (%s, %s, %s, %s, 'delivering', %s, %s, %s)
-                    ON CONFLICT (client_id, session_id) DO UPDATE
-                        SET status = 'delivering', started_at = %s
-                """, (delivery_id, MISTRAL_CLIENT_ID, session_id, project_id,
-                      now, size_bytes, duration_seconds, now))
-
-                cur.execute("""
-                    UPDATE sessions
-                    SET pipeline_status     = 'delivering',
-                        delivering_at       = COALESCE(delivering_at, %s),
-                        delivery_pending_at = COALESCE(delivery_pending_at, %s),
-                        client_id           = %s,
-                        size_bytes          = COALESCE(size_bytes, %s)
-                    WHERE session_id = %s
-                """, (now, now, MISTRAL_CLIENT_ID, size_bytes, session_id))
-
-        conn.close()
-        logging.info("  DB: %s → delivering (client: %s)", session_id, MISTRAL_CLIENT_ID)
-        return True
-    except Exception as exc:
-        logging.error("  DB erreur (start_delivery) : %s", exc)
+        r = requests.post(
+            f"{BACKEND_URL}/pipeline/sessions/{session_ref}/mark-sent",
+            json={
+                "client_id": MISTRAL_CLIENT_ID,
+                "client_name": MISTRAL_CLIENT_NAME,
+                "size_bytes": size_bytes,
+                "duration_seconds": duration_seconds,
+            },
+            headers=_backend_headers(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            logging.info("  Backend: %s → delivered (client: %s)", session_ref, MISTRAL_CLIENT_ID)
+            return True
+        logging.warning("  Backend erreur (mark-sent) [%s]: %s", r.status_code, r.text)
+        return False
+    except requests.RequestException as exc:
+        logging.error("  Backend erreur (mark-sent) : %s", exc)
         return False
 
 
-def db_confirm_delivered(session_id: str, size_bytes: int, duration_seconds: float) -> bool:
-    """
-    Marque la session et la livraison client comme 'delivered'.
-    Appelé après upload réussi.
-    """
-    now = _now()
-    delivery_id = f"del_{session_id}_{MISTRAL_CLIENT_ID}"
+def api_mark_send_failed(session_ref: str) -> None:
+    """Appelle le backend pour marquer l'envoi de la session comme échoué."""
     try:
-        conn = _pg_connect()
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE client_deliveries
-                    SET status = 'delivered', delivered_at = %s
-                    WHERE delivery_id = %s
-                """, (now, delivery_id))
-
-                cur.execute("""
-                    UPDATE sessions
-                    SET pipeline_status  = 'delivered',
-                        delivered_at     = %s,
-                        size_bytes       = COALESCE(size_bytes, %s),
-                        duration_seconds = COALESCE(duration_seconds, %s)
-                    WHERE session_id = %s
-                    RETURNING session_id
-                """, (now, size_bytes, duration_seconds or None, session_id))
-                updated = cur.fetchone() is not None
-
-        conn.close()
-        if updated:
-            logging.info("  DB: %s → delivered (client: %s)", session_id, MISTRAL_CLIENT_ID)
+        r = requests.post(
+            f"{BACKEND_URL}/pipeline/sessions/{session_ref}/mark-send-failed",
+            json={"client_id": MISTRAL_CLIENT_ID},
+            headers=_backend_headers(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            logging.info("  Backend: %s → delivery_failed", session_ref)
         else:
-            logging.warning("  DB: session '%s' introuvable lors de la confirmation", session_id)
-        return updated
-    except Exception as exc:
-        logging.error("  DB erreur (confirm_delivered) : %s", exc)
-        return False
+            logging.warning("  Backend erreur (mark-send-failed) [%s]: %s", r.status_code, r.text)
+    except requests.RequestException as exc:
+        logging.error("  Backend erreur (mark-send-failed) : %s", exc)
 
 
-def db_mark_delivery_failed(session_id: str) -> None:
-    """Marque la session et la livraison client comme 'delivery_failed'."""
-    now = _now()
-    delivery_id = f"del_{session_id}_{MISTRAL_CLIENT_ID}"
-    try:
-        conn = _pg_connect()
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    UPDATE client_deliveries
-                    SET status = 'failed', error_msg = 'Upload Mistral échoué'
-                    WHERE delivery_id = %s
-                """, (delivery_id,))
-                cur.execute("""
-                    UPDATE sessions
-                    SET pipeline_status    = 'delivery_failed',
-                        delivery_failed_at = %s
-                    WHERE session_id = %s
-                """, (now, session_id))
-        conn.close()
-        logging.info("  DB: %s → delivery_failed", session_id)
-    except Exception as exc:
-        logging.error("  DB erreur (mark_delivery_failed) : %s", exc)
+# ---------------------------------------------------------------------------
+# Validation d'intégrité — structure complète de la session
+# ---------------------------------------------------------------------------
+
+# Taille minimale d'un MP4 valide (encodage non-corrompu)
+MP4_MIN_BYTES = 100_000  # 100 KB
+
+
+def validate_session(session_dir: Path) -> list[str]:
+    """
+    Vérifie que la session est structurellement complète et sans problème connu.
+    Retourne une liste d'issues (vide = session valide).
+
+    Checks :
+      1. result.json existe et indique SUCCESS
+      2. config.json lisible, caméras sans erreur
+      3. mission.json présent
+      4. analysis.json : sync_check.ok doit être True
+      5. Pour chaque caméra (config) : <name>.mp4 ≥ 100 KB et <name>.jsonl non-vide
+      6. cameras/resampled_30hz.jsonl non-vide
+      7. Pour chaque capteur (config) : sensors/<name>.jsonl non-vide
+    """
+    issues: list[str] = []
+
+    # 1. result.json
+    result_path = session_dir / "result.json"
+    if not result_path.exists():
+        issues.append("result.json manquant")
+    else:
+        try:
+            res = json.loads(result_path.read_text(encoding="utf-8"))
+            result_val = str(res.get("result", "")).upper()
+            if result_val != "SUCCESS":
+                issues.append(f"result.json non-SUCCESS (valeur : '{res.get('result')}')")
+        except Exception as exc:
+            issues.append(f"result.json illisible : {exc}")
+
+    # 2. config.json — lit les caméras et capteurs attendus
+    config_path = session_dir / "config.json"
+    expected_cameras: list[str] = []
+    expected_sensors: list[str] = []
+    if not config_path.exists():
+        issues.append("config.json manquant")
+    else:
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            for cam in cfg.get("cameras", []):
+                name = cam.get("name")
+                if not name:
+                    continue
+                expected_cameras.append(name)
+                if cam.get("error"):
+                    issues.append(f"caméra '{name}' : erreur hardware ({cam['error']})")
+            for sen in cfg.get("sensors", []):
+                name = sen.get("name")
+                if name:
+                    expected_sensors.append(name)
+        except Exception as exc:
+            issues.append(f"config.json illisible : {exc}")
+
+    # 3. mission.json
+    if not (session_dir / "mission.json").exists():
+        issues.append("mission.json manquant")
+
+    # 4. analysis.json — sync_check
+    analysis_path = session_dir / "analysis.json"
+    if analysis_path.exists():
+        try:
+            data = json.loads(analysis_path.read_text(encoding="utf-8"))
+            sync = data.get("sync_check", {})
+            if isinstance(sync.get("ok"), bool) and not sync["ok"]:
+                delta = sync.get("delta_sec", "?")
+                issues.append(f"sync_check échoué — delta={delta}s (caméras/capteurs désynchronisés)")
+        except Exception:
+            pass  # read_analysis_errors lèvera l'erreur si le fichier est corrompu
+
+    # 5. Fichiers caméra
+    cam_dir = session_dir / "cameras"
+    for name in expected_cameras:
+        mp4  = cam_dir / f"{name}.mp4"
+        jsonl = cam_dir / f"{name}.jsonl"
+
+        if not mp4.exists():
+            issues.append(f"cameras/{name}.mp4 manquant")
+        else:
+            size = mp4.stat().st_size
+            if size < MP4_MIN_BYTES:
+                issues.append(
+                    f"cameras/{name}.mp4 trop petit ({size} octets < {MP4_MIN_BYTES}) — "
+                    "encodage probablement corrompu"
+                )
+
+        if not jsonl.exists():
+            issues.append(f"cameras/{name}.jsonl manquant")
+        elif jsonl.stat().st_size == 0:
+            issues.append(f"cameras/{name}.jsonl vide — aucune frame enregistrée")
+
+    # resampled_30hz.jsonl — produit par le post-processing
+    resampled = cam_dir / "resampled_30hz.jsonl"
+    if expected_cameras:  # seulement si des caméras sont attendues
+        if not resampled.exists():
+            issues.append("cameras/resampled_30hz.jsonl manquant — post-processing non terminé")
+        elif resampled.stat().st_size == 0:
+            issues.append("cameras/resampled_30hz.jsonl vide — resample échoué")
+
+    # 6. Fichiers capteurs
+    sen_dir = session_dir / "sensors"
+    for name in expected_sensors:
+        jsonl = sen_dir / f"{name}.jsonl"
+        if not jsonl.exists():
+            issues.append(f"sensors/{name}.jsonl manquant")
+        elif jsonl.stat().st_size == 0:
+            issues.append(f"sensors/{name}.jsonl vide — aucune donnée capteur")
+
+    return issues
 
 
 # ---------------------------------------------------------------------------
@@ -268,6 +344,35 @@ def analyze_session(session_dir: Path) -> tuple[bool, str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Analyse d'un candidat
+# ---------------------------------------------------------------------------
+
+def _analyze_one(session_dir_str: str) -> tuple:
+    """
+    Classifie une session candidate (lecture seule) :
+      ("invalid",  name, issues)   — structure incomplète/corrompue
+      ("rejected", name, errors)   — erreurs dans analysis.json
+      ("empty",    name, reason)   — pas de données
+      ("valid",    name, size)     — prête à être envoyée
+    """
+    s = Path(session_dir_str)
+
+    issues = validate_session(s)
+    if issues:
+        return (s.name, "invalid", issues)
+
+    errors = read_analysis_errors(s)
+    if errors:
+        return (s.name, "rejected", errors)
+
+    is_empty, reason, size = analyze_session(s)
+    if is_empty:
+        return (s.name, "empty", reason)
+
+    return (s.name, "valid", size)
+
+
+# ---------------------------------------------------------------------------
 # Dodge file helpers
 # ---------------------------------------------------------------------------
 
@@ -275,10 +380,13 @@ def load_dodge(root: Path) -> dict:
     dodge_path = root / DODGE_FILE
     if dodge_path.exists():
         try:
-            return json.loads(dodge_path.read_text(encoding="utf-8"))
+            dodge = json.loads(dodge_path.read_text(encoding="utf-8"))
+            dodge.setdefault("sessions", [])
+            dodge.setdefault("skipped", [])
+            return dodge
         except Exception:
             pass
-    return {"sessions": []}
+    return {"sessions": [], "skipped": []}
 
 
 def save_dodge(root: Path, dodge: dict) -> None:
@@ -295,19 +403,46 @@ def mark_uploaded(root: Path, dodge: dict, session_name: str, size_bytes: int, d
     save_dodge(root, dodge)
 
 
+def mark_skipped(root: Path, dodge: dict, session_name: str, kind: str, detail) -> None:
+    dodge["skipped"].append({
+        "name": session_name,
+        "kind": kind,
+        "detail": detail,
+    })
+    save_dodge(root, dodge)
+
+
 # ---------------------------------------------------------------------------
 # Metadata helpers
 # ---------------------------------------------------------------------------
 
 def read_duration(session_dir: Path) -> float:
-    meta = session_dir / "metadata.json"
-    if not meta.exists():
+    """
+    Durée totale d'une session, calculée depuis analysis.json : on prend le
+    max des duration_sec de toutes les caméras (fps_check) et de tous les
+    capteurs (sensor_check), c'est-à-dire le flux le plus long.
+    """
+    analysis_path = session_dir / "analysis.json"
+    if not analysis_path.exists():
         return 0.0
     try:
-        data = json.loads(meta.read_text(encoding="utf-8"))
-        return float(data.get("duration_seconds", 0))
+        data = json.loads(analysis_path.read_text(encoding="utf-8"))
     except Exception:
         return 0.0
+
+    durations = []
+
+    cams = data.get("fps_check", {}).get("cameras", {})
+    for c in (cams or {}).values():
+        if isinstance(c, dict):
+            durations.append(c.get("duration_sec") or 0)
+
+    sensors = data.get("sensor_check", {}).get("sensors", {})
+    for s in (sensors or {}).values():
+        if isinstance(s, dict):
+            durations.append(s.get("duration_sec") or 0)
+
+    return max(durations, default=0.0)
 
 
 def format_duration(total_seconds: float) -> str:
@@ -418,13 +553,19 @@ def move_session_to_sent(session_dir: Path, sent_dir: Path) -> bool:
 # ---------------------------------------------------------------------------
 
 def zip_session(session_dir: Path, tmp_dir: Path) -> Path:
-    zip_base = tmp_dir / session_dir.name
-    archive = shutil.make_archive(
-        str(zip_base), "zip",
-        root_dir=session_dir.parent,
-        base_dir=session_dir.name,
-    )
-    return Path(archive)
+    """
+    Crée tmp_dir/<session_dir.name>.zip, contenu sous '<session_dir.name>/...'
+    (équivalent à shutil.make_archive). Implémentation manuelle car
+    make_archive() fait os.chdir() — non thread-safe avec UPLOAD_WORKERS > 1
+    (plusieurs threads se marchent sur le cwd du process, d'où
+    'FileNotFoundError: ... sessions').
+    """
+    zip_path = tmp_dir / f"{session_dir.name}.zip"
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for f in session_dir.rglob("*"):
+            if f.is_file():
+                zf.write(f, Path(session_dir.name) / f.relative_to(session_dir))
+    return zip_path
 
 
 # ---------------------------------------------------------------------------
@@ -437,9 +578,17 @@ def main() -> None:
     parser.add_argument("dossier", help="Dossier racine contenant les sessions")
     parser.add_argument("--dry-run", action="store_true",
                         help="Analyse et affiche ce qui serait envoyé, sans rien uploader ni déplacer")
+    parser.add_argument("--max-sessions", type=int, default=0,
+                        help="Nombre maximum de sessions à envoyer par exécution (0 = illimité)")
+    parser.add_argument("--all", action="store_true",
+                        help="Envoie toutes les sessions valides, sans plafond de volume "
+                             "(ignore MAX_RUN_GB). Combinable avec --max-sessions.")
     args = parser.parse_args()
 
     dry_run = args.dry_run
+    max_sessions = args.max_sessions
+    send_all = args.all
+    max_run_bytes = float("inf") if send_all else MAX_RUN_BYTES
     root = Path(args.dossier)
 
     if not root.is_dir():
@@ -447,12 +596,14 @@ def main() -> None:
         sys.exit(1)
 
     if dry_run:
-        print("*** MODE DRY-RUN — aucun upload, aucun déplacement, aucune écriture DB ***\n")
+        print("*** MODE DRY-RUN — aucun upload, aucun déplacement, aucune écriture DB/persistance ***\n")
 
     sent_dir = root.parent / "session_envoye"
 
     dodge = load_dodge(root)
-    already_done = {e["name"] for e in dodge["sessions"]}
+    sent_names    = {e["name"] for e in dodge["sessions"]}
+    skipped_names = {e["name"] for e in dodge["skipped"]}
+    already_done  = sent_names | skipped_names
 
     print(f"Lecture de '{root}'...", flush=True)
     all_sessions = sorted(p for p in root.iterdir() if p.is_dir() and p.name.lower().startswith("session"))
@@ -461,139 +612,164 @@ def main() -> None:
         print(f"Aucun dossier 'session*' trouvé dans '{root}'", flush=True)
         sys.exit(0)
 
-    # Sessions déjà envoyées : on les saute sans les analyser
-    skipped = [s.name for s in all_sessions if s.name in already_done]
     candidates = [s for s in all_sessions if s.name not in already_done]
 
-    print(f"{len(all_sessions)} dossier(s) dont {len(skipped)} déjà envoyé(s). "
-          f"Analyse de {len(candidates)} candidat(s)...", flush=True)
-
-    # --- Analyse au fil de l'eau : on s'arrête dès que le quota est atteint ---
-    empty_sessions:    list[tuple[str, str]]       = []
-    rejected_sessions: list[tuple[str, list[str]]] = []
-    to_send:           list[tuple[Path, int]]       = []
-    capped_count = 0
-    cumul_bytes  = 0
-
-    for s in candidates:
-        if cumul_bytes >= MAX_RUN_BYTES:
-            capped_count += 1
-            continue
-
-        print(f"  Analyse {s.name} ...", end="\r", flush=True)
-
-        # 1. Vérifier analysis.json — ignorer si des erreurs sont présentes
-        errors = read_analysis_errors(s)
-        if errors:
-            rejected_sessions.append((s.name, errors))
-            continue
-
-        # 2. Vérifier que la session n'est pas vide
-        is_empty, reason, size = analyze_session(s)
-        if is_empty:
-            empty_sessions.append((s.name, reason))
-        elif cumul_bytes + size > MAX_RUN_BYTES:
-            capped_count += 1
-        else:
-            to_send.append((s, size))
-            cumul_bytes += size
-
-    print(" " * 60, end="\r", flush=True)
-
-    print(f"{len(all_sessions)} session(s) trouvée(s) au total :", flush=True)
-    print(f"  {len(empty_sessions)} vide(s) — ignorées")
-    print(f"  {len(rejected_sessions)} rejetée(s) — erreurs analysis.json")
-    print(f"  {len(skipped)} déjà envoyée(s) — ignorées")
-    print(f"  {capped_count} non analysée(s) — plafond {format_size(MAX_RUN_BYTES)} atteint")
-    print(f"  {len(to_send)} à envoyer ({format_size(cumul_bytes)})")
-
-    if rejected_sessions:
-        print("\nSessions rejetées (erreurs analysis.json) :")
-        for name, errs in rejected_sessions:
-            print(f"  REJET  {name}")
-            for e in errs:
-                print(f"         - {e}")
-
-    if empty_sessions:
-        print("\nSessions vides :")
-        for name, reason in empty_sessions:
-            print(f"  VIDE  {name}  ({reason})")
-
-    if skipped:
-        print(f"\nIgnorées (dodge) : {skipped}")
-    if capped_count:
-        print(f"\n{capped_count} session(s) non analysée(s) — seront traitées aux prochains runs.")
+    print(f"{len(all_sessions)} dossier(s) — {len(sent_names)} déjà envoyé(s), "
+          f"{len(skipped_names)} déjà écarté(s) (problème connu). "
+          f"{len(candidates)} candidat(s) à traiter.", flush=True)
     print(flush=True)
 
-    if not to_send:
-        print("Aucune session à envoyer.", flush=True)
-    elif dry_run:
-        print("\nSessions qui seraient envoyées :")
-        for i, (session_dir, size) in enumerate(to_send, 1):
-            folder_name = session_dir.name
-            db_session_id = db_resolve_session_id(folder_name)
+    sent_count   = 0   # réservation pour le quota (sessions soumises à l'envoi)
+    capped_count = 0
+    cumul_bytes  = 0   # réservation pour le quota
+    processed_count = 0
+    sent_this_run: list[tuple[str, int, float]] = []
+    failed_names: list[str] = []
+
+    total = len(candidates)
+    candidates_iter = iter(candidates)
+
+    with tempfile.TemporaryDirectory() as tmp_dir, \
+            ProcessPoolExecutor(max_workers=ANALYZE_PROCESSES) as analysis_pool, \
+            ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as upload_pool:
+
+        def _upload_one(session_dir: Path, size: int) -> tuple:
+            name = session_dir.name
+            db_session_id = db_register_session(session_dir)
             duration = read_duration(session_dir)
-            print(f"  [{i}/{len(to_send)}] {folder_name}  ({format_size(size)}, {format_duration(duration)})")
+
+            if dry_run:
+                return (session_dir, size, duration, db_session_id, "dry-run", 0)
+
             if db_session_id:
-                print(f"           DB → {db_session_id}")
+                print(f"  [{name}] DB session_id : {db_session_id}", flush=True)
             else:
-                print(f"           DB → introuvable (upload sans mise à jour DB)")
-    else:
-        with tempfile.TemporaryDirectory() as tmp_dir:
-            for i, (session_dir, _) in enumerate(to_send, 1):
-                folder_name = session_dir.name
-                print(f"[{i}/{len(to_send)}] '{folder_name}'", flush=True)
+                print(f"  [{name}] Avertissement : session introuvable/non enregistrée en DB — upload sans mise à jour DB", flush=True)
 
-                # Résoudre le session_id DB (peut différer du nom de dossier NAS)
-                db_session_id = db_resolve_session_id(folder_name)
-                if db_session_id:
-                    print(f"  DB session_id : {db_session_id}", flush=True)
-                else:
-                    print(f"  Avertissement : session '{folder_name}' introuvable en DB — upload sans mise à jour DB", flush=True)
+            zip_path = zip_session(session_dir, Path(tmp_dir))
+            zip_size = zip_path.stat().st_size
+            print(f"  [{name}] Archive : {zip_path.name}  ({format_size(zip_size)})", flush=True)
 
-                zip_path = zip_session(session_dir, Path(tmp_dir))
-                zip_size = zip_path.stat().st_size
-                print(f"  Archive : {zip_path.name}  ({format_size(zip_size)})", flush=True)
+            success = upload_zip_to_mistral(str(zip_path))
+            zip_path.unlink(missing_ok=True)
 
-                if db_session_id:
-                    db_start_delivery(db_session_id, zip_size)
+            session_ref = db_session_id or name
+            if success:
+                api_mark_sent(session_ref, zip_size, duration)
+            else:
+                api_mark_send_failed(session_ref)
 
-                success = upload_zip_to_mistral(str(zip_path))
+            return (session_dir, size, duration, db_session_id, "ok" if success else "failed", zip_size)
 
-                if success:
-                    duration = read_duration(session_dir)
+        # pending : future -> ("analyze", session_dir) | ("upload",)
+        pending: dict = {}
+
+        def submit_next_analysis() -> None:
+            try:
+                s = next(candidates_iter)
+            except StopIteration:
+                return
+            fut = analysis_pool.submit(_analyze_one, str(s))
+            pending[fut] = ("analyze", s)
+
+        # Amorce le pipeline d'analyse (fenêtre glissante, pas d'attente globale)
+        for _ in range(max(ANALYZE_PROCESSES * 2, 1)):
+            submit_next_analysis()
+
+        while pending:
+            done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+            for fut in done:
+                tag, *rest = pending.pop(fut)
+
+                if tag == "analyze":
+                    session_dir, = rest
+                    name = session_dir.name
+                    _, kind, detail = fut.result()
+                    processed_count += 1
+                    print(f"[{processed_count}/{total}] {name}", flush=True)
+
+                    if kind == "invalid":
+                        print("  INVALIDE — structure incomplète/corrompue :")
+                        for issue in detail:
+                            print(f"    - {issue}")
+                        if not dry_run:
+                            mark_skipped(root, dodge, name, kind, detail)
+                        print(flush=True)
+                        submit_next_analysis()
+                        continue
+
+                    if kind == "rejected":
+                        print("  REJET — erreurs dans analysis.json :")
+                        for err in detail:
+                            print(f"    - {err}")
+                        if not dry_run:
+                            mark_skipped(root, dodge, name, kind, detail)
+                        print(flush=True)
+                        submit_next_analysis()
+                        continue
+
+                    if kind == "empty":
+                        print(f"  VIDE — {detail}")
+                        if not dry_run:
+                            mark_skipped(root, dodge, name, kind, detail)
+                        print(flush=True)
+                        submit_next_analysis()
+                        continue
+
+                    # kind == "valid" → detail = taille en octets
+                    size = detail
+                    if (max_sessions > 0 and sent_count >= max_sessions) or cumul_bytes + size > max_run_bytes:
+                        capped_count += 1
+                        print(f"  Plafond atteint — reporté au prochain run ({format_size(size)})", flush=True)
+                        print(flush=True)
+                        submit_next_analysis()
+                        continue
+
+                    sent_count += 1
+                    cumul_bytes += size
+                    ufut = upload_pool.submit(_upload_one, session_dir, size)
+                    pending[ufut] = ("upload",)
+                    submit_next_analysis()
+                    continue
+
+                # tag == "upload"
+                session_dir, size, duration, db_session_id, status, zip_size = fut.result()
+                name = session_dir.name
+
+                if status == "dry-run":
+                    print(f"  [{name}] VALIDE — serait envoyée ({format_size(size)}, {format_duration(duration)})")
                     if db_session_id:
-                        db_confirm_delivered(db_session_id, zip_size, duration)
-                    mark_uploaded(root, dodge, folder_name, zip_size, duration)
+                        print(f"           DB → {db_session_id}")
+                    else:
+                        print("           DB → introuvable (upload sans mise à jour DB)")
+                    print(flush=True)
+                    continue
+
+                if status == "ok":
+                    mark_uploaded(root, dodge, name, zip_size, duration)
                     move_session_to_sent(session_dir, sent_dir)
+                    sent_this_run.append((name, zip_size, duration))
                 else:
-                    if db_session_id:
-                        db_mark_delivery_failed(db_session_id)
+                    failed_names.append(name)
 
                 print(flush=True)
 
     if dry_run:
-        print("\n*** DRY-RUN terminé — rien n'a été modifié ***")
+        print("*** DRY-RUN terminé — rien n'a été modifié ***")
         sys.exit(0)
 
-    # --- Résumé global depuis le dodge file ---
-    total_bytes = sum(e["size_bytes"] for e in dodge["sessions"])
-    total_seconds = sum(e["duration_seconds"] for e in dodge["sessions"])
-    sent_this_run = [e for e in dodge["sessions"] if e["name"] not in already_done]
-    sent_names = {e["name"] for e in dodge["sessions"]}
-    failed_this_run = [s.name for s, _ in to_send if s.name not in sent_names]
-
+    sent_bytes = sum(sz for _, sz, _ in sent_this_run)
     print("=== Résumé de cette exécution ===")
-    for e in sent_this_run:
-        print(f"  OK     {e['name']}  ({format_size(e['size_bytes'])}, {format_duration(e['duration_seconds'])})")
-    for name in failed_this_run:
+    print(f"  Sessions envoyées : {len(sent_this_run)}  ({format_size(sent_bytes)})")
+    for name, sz, dur in sent_this_run:
+        print(f"  OK     {name}  ({format_size(sz)}, {format_duration(dur)})")
+    for name in failed_names:
         print(f"  ECHEC  {name}")
-    for name, errs in rejected_sessions:
-        print(f"  REJET  {name}  ({len(errs)} erreur(s) : {errs[0]}{'…' if len(errs) > 1 else ''})")
-    for name, reason in empty_sessions:
-        print(f"  VIDE   {name}  ({reason})")
     if capped_count:
-        print(f"  REPORT {capped_count} session(s) non analysée(s) — prochains runs")
+        print(f"  REPORT {capped_count} session(s) — plafond atteint, prochains runs")
+
+    total_bytes   = sum(e["size_bytes"] for e in dodge["sessions"])
+    total_seconds = sum(e["duration_seconds"] for e in dodge["sessions"])
 
     print()
     print("=== Cumul total envoyé (toutes exécutions) ===")
@@ -601,7 +777,7 @@ def main() -> None:
     print(f"  Volume total      : {format_size(total_bytes)}")
     print(f"  Durée totale      : {format_duration(total_seconds)}")
 
-    sys.exit(0 if not failed_this_run else 1)
+    sys.exit(0 if not failed_names else 1)
 
 
 if __name__ == "__main__":
