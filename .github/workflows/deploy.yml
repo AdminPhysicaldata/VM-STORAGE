@@ -1,0 +1,26 @@
+name: Deploy
+
+on:
+  push:
+    branches: [main]
+
+jobs:
+  deploy:
+    name: Deploy to VM-STORAGE
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Deploy via SSH
+        uses: appleboy/ssh-action@v1.2.0
+        with:
+          host: 154.120.134.102
+          port: 6642
+          username: phd
+          key: ${{ secrets.SSH_PRIVATE_KEY }}
+          script: |
+            set -e
+            cd /home/phd/VM-STORAGE
+            sudo git pull origin main
+            sudo docker compose down
+            sudo docker compose up --build -d
+            sudo docker compose ps
