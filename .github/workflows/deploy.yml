@@ -17,6 +17,7 @@ jobs:
           port: 6642
           username: phd
           key: ${{ secrets.SSH_PRIVATE_KEY }}
+          command_timeout: 30m
           script: |
             set -e
             cd /home/phd/VM-STORAGE
