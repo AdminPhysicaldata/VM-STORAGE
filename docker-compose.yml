@@ -11,7 +11,6 @@ services:
       - "2222:22"
     volumes:
       - sessions_data:/home/${SFTP_USER}/sessions
-      - ./sftp-keys:/home/${SFTP_USER}/.ssh/keys:ro
     command: "${SFTP_USER}:${SFTP_PASS}:1000:1000:sessions"
     healthcheck:
       test: ["CMD", "pgrep", "sshd"]
