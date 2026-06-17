@@ -1,0 +1,8 @@
+session_envoye/
+sessions/
+session_2*/
+*.zip
+uploaded_sessions.json
+__pycache__/
+*.pyc
+.env

@@ -108,6 +108,29 @@ services:
       SYNC_WORKERS: ${SYNC_WORKERS:-2}
       MIN_FREE_BYTES: ${MIN_FREE_BYTES:-10737418240}
 
+  post-pipeline:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: post/Dockerfile
+    container_name: post-pipeline
+    restart: always
+    volumes:
+      # PAS de :ro ici : ce service renomme des fichiers, écrit le cache
+      # .postcheck.json et déplace les sessions en anomalie vers la quarantaine.
+      - sessions_data:/data/sessions
+      - sessions_quarantine_data:/data/sessions_quarantine
+      - post_reports_data:/data/reports
+    environment:
+      TZ: ${POST_PIPELINE_TZ:-UTC}
+      SESSIONS_DIR: /data/sessions
+      QUARANTINE_DIR: /data/sessions_quarantine
+      REPORTS_DIR: /data/reports
+      RUN_AT: ${POST_PIPELINE_RUN_AT:-03:00}
+      WORKERS: ${POST_PIPELINE_WORKERS:-4}
+      APPLY: ${POST_PIPELINE_APPLY:-0}
+      KEEP_REPORTS: ${POST_PIPELINE_KEEP_REPORTS:-30}
+
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.50.0
     container_name: cadvisor-storage
@@ -135,6 +158,14 @@ volumes:
       type: none
       o: bind
       device: ${SESSIONS_ENVOYE_PATH}
+  sessions_quarantine_data:
+    driver: local
+    driver_opts:
+      type: none
+      o: bind
+      device: ${SESSIONS_QUARANTINE_PATH}
+  post_reports_data:
+    driver: local
 
 networks:
   default:
