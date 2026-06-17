@@ -73,6 +73,7 @@ services:
     restart: always
     volumes:
       - sessions_data:/data/sessions:ro
+      - /mnt:/mnt:ro
     environment:
       SESSIONS_DIR: /data/sessions
       POSTGRES_HOST: ${VM_DATA_IP}
@@ -82,6 +83,30 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
       SCAN_INTERVAL: ${FS_SCANNER_INTERVAL:-15}
       STABILITY_SECONDS: ${FS_SCANNER_STABILITY:-60}
+      DISK_MOUNTS: ${DISK_MOUNTS:-/data/sessions:ssd:SSD principal:local-ssd-data}
+      DISK_AUTODISCOVER_GLOB: ${DISK_AUTODISCOVER_GLOB:-/mnt/*}
+      DISK_SCAN_INTERVAL: ${DISK_SCAN_INTERVAL:-300}
+
+  sync-ssd-hdd:
+    platform: linux/amd64
+    build:
+      context: .
+      dockerfile: fs-scanner/Dockerfile
+    container_name: sync-ssd-hdd
+    restart: always
+    entrypoint: ["python", "-u", "sync_ssd_to_hdd.py"]
+    command: ["--watch", "--interval", "${SYNC_INTERVAL:-300}"]
+    volumes:
+      - sessions_data:/data/sessions:ro
+      - /mnt:/mnt
+    environment:
+      POSTGRES_HOST: ${VM_DATA_IP}
+      POSTGRES_PORT: "5432"
+      POSTGRES_DB: ${POSTGRES_DB}
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      SYNC_WORKERS: ${SYNC_WORKERS:-2}
+      MIN_FREE_BYTES: ${MIN_FREE_BYTES:-10737418240}
 
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.50.0

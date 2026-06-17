@@ -36,9 +36,20 @@ Variables d'environnement :
   DB_BATCH                Sessions par commit DB         (défaut: 500)
   STABILITY_SECONDS       Stabilité avant traitement     (défaut: 60)
   SCAN_INTERVAL           Intervalle watch en s          (défaut: 15)
+  DISK_MOUNTS             Disques SSD/HDD à suivre explicitement, format
+                          "mount_path:type:label:disk_uuid" séparés par ';'
+                          (défaut: "<SESSIONS_DIR>:ssd:SSD principal:local-ssd-data")
+  DISK_AUTODISCOVER_GLOB  Pattern glob de points de montage HDD à découvrir
+                          automatiquement (défaut: "/mnt/*"). Chaque répertoire
+                          qui est un vrai point de montage (os.path.ismount) et
+                          absent de DISK_MOUNTS est ajouté comme disque HDD —
+                          permet d'ajouter/retirer des disques physiques sans
+                          modifier la config.
+  DISK_SCAN_INTERVAL      Intervalle scan disques en s   (défaut: 300)
   POSTGRES_HOST/PORT/DB/USER/PASSWORD
 """
 
+import glob
 import json
 import logging
 import os
@@ -60,6 +71,18 @@ SCAN_WORKERS      = int(os.environ.get("SCAN_WORKERS",  str(max(1, (cpu_count() 
 DB_BATCH          = int(os.environ.get("DB_BATCH",      "500"))
 STABILITY_SECONDS = int(os.environ.get("STABILITY_SECONDS", "60"))
 SCAN_INTERVAL     = int(os.environ.get("SCAN_INTERVAL", "15"))
+
+# Disques de stockage (SSD à expédier / HDD de sauvegarde) — voir _scan_disks().
+# Format : "mount_path:type:label:disk_uuid" (type = ssd|hdd), séparés par ';'.
+DISK_MOUNTS = os.environ.get(
+    "DISK_MOUNTS",
+    f"{SESSIONS_DIR}:ssd:SSD principal:local-ssd-data",
+)
+# Pattern glob de points de montage à découvrir automatiquement (nouveaux
+# disques HDD branchés/montés sans avoir à toucher la config) — voir
+# _discover_disks().
+DISK_AUTODISCOVER_GLOB = os.environ.get("DISK_AUTODISCOVER_GLOB", "/mnt/*")
+DISK_SCAN_INTERVAL = int(os.environ.get("DISK_SCAN_INTERVAL", "300"))
 
 
 # ── Connexion PostgreSQL ───────────────────────────────────────────────────────
@@ -700,6 +723,176 @@ def _recalculate_kpis(conn) -> None:
     logger.info("Recalcul KPI terminé.")
 
 
+# ── Disques de stockage (SSD/HDD) ───────────────────────────────────────────────
+# Répartit les sessions par disque physique (storage_disks, table créée par
+# la migration 008). Code additif : n'interfère jamais avec le scoring /
+# les KPI ci-dessus, et n'interrompt jamais la boucle principale en cas
+# d'erreur (ex : migration pas encore appliquée, disque pas encore monté).
+
+def _parse_disk_mounts() -> list:
+    """Parse DISK_MOUNTS = 'mount_path:type:label:disk_uuid;...'."""
+    disks = []
+    for entry in DISK_MOUNTS.split(";"):
+        entry = entry.strip()
+        if not entry:
+            continue
+        parts = entry.split(":")
+        if len(parts) < 4:
+            logger.warning("DISK_MOUNTS : entrée invalide ignorée : %s", entry)
+            continue
+        mount_path, disk_type, label = parts[0].strip(), parts[1].strip().lower(), parts[2].strip()
+        disk_uuid = ":".join(parts[3:]).strip()
+        if disk_type not in ("ssd", "hdd"):
+            logger.warning("DISK_MOUNTS : type invalide (%s) pour %s, ignoré", disk_type, entry)
+            continue
+        if not disk_uuid:
+            logger.warning("DISK_MOUNTS : disk_uuid manquant pour %s, ignoré", entry)
+            continue
+        disks.append({
+            "mount_path": mount_path,
+            "disk_type":  disk_type,
+            "label":      label,
+            "disk_uuid":  disk_uuid,
+        })
+    return disks
+
+
+def _autodiscover_disks(known_paths: set) -> list:
+    """Découvre les points de montage HDD non déclarés explicitement dans
+    DISK_MOUNTS, via le pattern DISK_AUTODISCOVER_GLOB (défaut /mnt/*).
+    Permet d'ajouter/retirer des disques physiques sans toucher la config :
+    seuls les vrais points de montage (os.path.ismount) sont retenus, label
+    et disk_uuid sont dérivés du nom du dossier."""
+    disks = []
+    for path in sorted(glob.glob(DISK_AUTODISCOVER_GLOB)):
+        if path in known_paths or not os.path.ismount(path):
+            continue
+        name = os.path.basename(path.rstrip("/"))
+        disks.append({
+            "mount_path": path,
+            "disk_type":  "hdd",
+            "label":      name,
+            "disk_uuid":  f"local-{name}",
+        })
+    return disks
+
+
+def _discover_disks() -> list:
+    """Calcule total/used/free (os.statvfs) pour chaque disque configuré
+    (explicite + auto-découvert) dont le mount_path existe déjà. Les disques
+    pas encore montés sont ignorés."""
+    explicit = _parse_disk_mounts()
+    autodiscovered = _autodiscover_disks({d["mount_path"] for d in explicit})
+
+    disks = []
+    for disk in explicit + autodiscovered:
+        path = disk["mount_path"]
+        if not os.path.isdir(path):
+            logger.debug("Disque %s (%s) : chemin %s absent, ignoré",
+                         disk["disk_uuid"], disk["disk_type"], path)
+            continue
+        try:
+            st = os.statvfs(path)
+            total = st.f_frsize * st.f_blocks
+            free  = st.f_frsize * st.f_bavail
+            used  = total - (st.f_frsize * st.f_bfree)
+        except OSError as exc:
+            logger.warning("Disque %s : statvfs(%s) a échoué : %s", disk["disk_uuid"], path, exc)
+            continue
+        disks.append({**disk, "total_bytes": total, "used_bytes": used, "free_bytes": free})
+    return disks
+
+
+def _upsert_disks(conn, disks: list) -> None:
+    with conn.cursor() as cur:
+        for d in disks:
+            cur.execute("""
+                INSERT INTO storage_disks (
+                    disk_uuid, server_id, disk_type, label, mount_path,
+                    total_bytes, used_bytes, free_bytes, last_scanned_at, updated_at
+                ) VALUES (%s, 'vm-storage', %s, %s, %s, %s, %s, %s, now(), now())
+                ON CONFLICT (disk_uuid) DO UPDATE SET
+                    disk_type       = EXCLUDED.disk_type,
+                    label           = COALESCE(storage_disks.label, EXCLUDED.label),
+                    mount_path      = EXCLUDED.mount_path,
+                    total_bytes     = EXCLUDED.total_bytes,
+                    used_bytes      = EXCLUDED.used_bytes,
+                    free_bytes      = EXCLUDED.free_bytes,
+                    last_scanned_at = now(),
+                    updated_at      = now()
+            """, (
+                d["disk_uuid"], d["disk_type"], d["label"], d["mount_path"],
+                d["total_bytes"], d["used_bytes"], d["free_bytes"],
+            ))
+    conn.commit()
+
+
+def _assign_sessions_to_disk(conn, disk: dict) -> None:
+    """Met à jour ssd_disk_uuid / hdd_disk_uuid : assigne ce disque aux sessions
+    dont le dossier est présent dans son mount_path, et désassigne les sessions
+    qui y pointaient mais dont le dossier a disparu (ex : SSD vidé après envoi)."""
+    folders = _list_sessions(disk["mount_path"])
+    col = "ssd_disk_uuid" if disk["disk_type"] == "ssd" else "hdd_disk_uuid"
+    with conn.cursor() as cur:
+        if folders:
+            cur.execute(f"""
+                UPDATE sessions SET {col} = %s
+                WHERE session_folder = ANY(%s) AND {col} IS DISTINCT FROM %s
+            """, (disk["disk_uuid"], folders, disk["disk_uuid"]))
+        cur.execute(f"""
+            UPDATE sessions SET {col} = NULL
+            WHERE {col} = %s
+              AND session_folder IS NOT NULL
+              AND NOT (session_folder = ANY(%s))
+        """, (disk["disk_uuid"], folders))
+    conn.commit()
+
+
+def _recalculate_disk_stats(conn) -> None:
+    """Recalcule session_count / sessions_delivered_count pour chaque disque
+    (une session est "livrée" si pipeline_status='delivered' OU si elle a une
+    ligne client_deliveries au statut 'delivered')."""
+    with conn.cursor() as cur:
+        cur.execute("""
+            UPDATE storage_disks sd SET
+                session_count = (
+                    SELECT COUNT(*) FROM sessions s
+                    WHERE s.ssd_disk_uuid = sd.disk_uuid OR s.hdd_disk_uuid = sd.disk_uuid
+                ),
+                sessions_delivered_count = (
+                    SELECT COUNT(*) FROM sessions s
+                    WHERE (s.ssd_disk_uuid = sd.disk_uuid OR s.hdd_disk_uuid = sd.disk_uuid)
+                      AND (
+                          s.pipeline_status = 'delivered'
+                          OR EXISTS (
+                              SELECT 1 FROM client_deliveries cd
+                              WHERE cd.session_id = s.session_id AND cd.status = 'delivered'
+                          )
+                      )
+                ),
+                updated_at = now()
+        """)
+    conn.commit()
+
+
+def _scan_disks(conn) -> None:
+    """Point d'entrée disques : découverte + assignation + agrégats.
+    Ne lève jamais (table éventuellement absente si migration 008 pas
+    encore appliquée, disques pas encore montés, etc.)."""
+    try:
+        disks = _discover_disks()
+        if not disks:
+            return
+        _upsert_disks(conn, disks)
+        for disk in disks:
+            _assign_sessions_to_disk(conn, disk)
+        _recalculate_disk_stats(conn)
+        logger.info("Disques : %d disque(s) scanné(s)", len(disks))
+    except Exception:
+        conn.rollback()
+        logger.exception("Erreur lors du scan des disques (migration 008 appliquée ?)")
+
+
 # ── Bilan final ───────────────────────────────────────────────────────────────
 
 def _print_summary(conn, total_on_disk: int, valid_count: int,
@@ -883,6 +1076,9 @@ def run_once():
     # ── Étape 5 : recalcul KPI final ───────────────────────────────────────────
     _recalculate_kpis(conn)
 
+    # ── Étape 6 : répartition par disque (SSD/HDD) ─────────────────────────────
+    _scan_disks(conn)
+
     # ── Bilan final ────────────────────────────────────────────────────────────
     _print_summary(conn, len(to_scan), valid_count, total_duration_sec,
                     clean_duration_sec, time.monotonic() - t0)
@@ -907,8 +1103,20 @@ def watch_loop():
 
     logger.info("%d session(s) déjà traitées", len(processed))
 
+    last_disk_scan = 0.0
+
     while True:
         now = time.monotonic()
+
+        # ── 0. Répartition par disque (SSD/HDD), throttlée ─────────────────────
+        if now - last_disk_scan >= DISK_SCAN_INTERVAL:
+            try:
+                disk_conn = _pg_connect()
+                _scan_disks(disk_conn)
+                disk_conn.close()
+            except Exception:
+                logger.exception("Connexion DB échouée pour le scan des disques")
+            last_disk_scan = now
 
         # ── 1. Vérifier stabilité en parallèle ─────────────────────────────────
         newly_stable = []
