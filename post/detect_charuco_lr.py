@@ -60,6 +60,7 @@ _GRIPPER_MIN_RATIO = 0.05   # >= 5% des frames échantillonnées voient les 2 ma
 _HEAD_MAX_RATIO = 0.02      # <= 2% → "head" (bruit/faux positifs tolérés)
 _CLASSIFY_FPS = 1.0         # passe légère : sert juste à trier head vs gripper
 _CURVE_FPS = 5.0            # passe dense : uniquement sur les 2 vidéos confirmées "gripper"
+_MIN_CONFIDENT_CORR = 0.15  # |corr| minimum pour considérer un appariement fiable (cf. analyze_session)
 
 
 # ─── Détecteur ArUco (compat anciennes/nouvelles API OpenCV) ────────────────
@@ -208,13 +209,14 @@ def _correlate(t_video, v_video, t_sensor, v_sensor) -> float:
 @dataclass
 class VideoFinding:
     current_name: str
-    role: str                  # "gripper" / "head" / "ambiguous"
+    role: str                  # "gripper" / "head" / "ambiguous" / "unreadable"
     ratio: float
     times: object = None
     dists: object = None
     inferred_name: str | None = None
     corr_left: float = float("nan")
     corr_right: float = float("nan")
+    confident: bool = True      # False = signal de corrélation trop faible pour conclure
 
 
 def analyze_session(
@@ -284,13 +286,26 @@ def analyze_session(
         score_ba = (a.corr_right if not np.isnan(a.corr_right) else -1) + \
                    (b.corr_left if not np.isnan(b.corr_left) else -1)
         if score_ab >= score_ba:
-            a.inferred_name, b.inferred_name = "left", "right"
+            pairing = ("left", "right")
+            winning_corrs = (a.corr_left, b.corr_right)
         else:
-            a.inferred_name, b.inferred_name = "right", "left"
+            pairing = ("right", "left")
+            winning_corrs = (a.corr_right, b.corr_left)
+
+        # Avec ~300-400 échantillons bruités (détection ArUco frame par frame,
+        # pas de filtrage sub-pixel), le bruit de fond d'une corrélation de Pearson
+        # tourne autour de ±0.06 (1/sqrt(n)). En dessous de _MIN_CONFIDENT_CORR, le
+        # "gagnant" choisi entre les deux appariements n'est pas distinguable du
+        # bruit : mieux vaut ne RIEN affirmer que de renommer sur une fausse piste.
+        best = max((abs(c) for c in winning_corrs if not np.isnan(c)), default=0.0)
+        confident = best >= _MIN_CONFIDENT_CORR
+        a.confident = b.confident = confident
+        if confident:
+            a.inferred_name, b.inferred_name = pairing
 
         # La 3ᵉ vidéo (rôle "head") doit elle aussi être renommée "head" si besoin —
         # sinon le renommage des 2 gripper pourrait écraser son fichier (collision).
-        if len(heads) == 1:
+        if confident and len(heads) == 1:
             heads[0].inferred_name = "head"
 
     return findings
@@ -309,8 +324,11 @@ def print_report(session_name: str, findings: list[VideoFinding]) -> bool:
         flag = "  ⚠ MAL NOMMÉE" if mismatch else ""
         if f.role == "gripper":
             extra = f"corr(left)={f.corr_left:.2f} corr(right)={f.corr_right:.2f}"
-            print(f"  {f.current_name:<8} [{f.role:<9}] {marker}  {extra}"
-                  f"  → identité réelle probable : {f.inferred_name}{flag}")
+            if not f.confident:
+                verdict = "signal trop faible pour conclure (vérification manuelle conseillée)"
+            else:
+                verdict = f"identité réelle probable : {f.inferred_name}"
+            print(f"  {f.current_name:<8} [{f.role:<9}] {marker}  {extra}  → {verdict}{flag}")
         else:
             suffix = f"  → identité réelle probable : {f.inferred_name}{flag}" if f.inferred_name else ""
             print(f"  {f.current_name:<8} [{f.role:<9}] {marker}{suffix}")

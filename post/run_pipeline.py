@@ -200,6 +200,11 @@ def _process_one(
                     )
                 if f.role == "unreadable":
                     lines.append(f"[charuco]   {f.current_name}.mp4 illisible/corrompue")
+                if f.role == "gripper" and not f.confident:
+                    lines.append(
+                        f"[charuco]   {f.current_name}.mp4 : signal trop faible pour confirmer left/right "
+                        f"(pas une anomalie, juste non vérifié)"
+                    )
             n_gripper = sum(1 for f in findings if f.role == "gripper")
             if n_gripper not in (0, 2):
                 lines.append(f"[charuco]   {n_gripper} vidéo(s) 'gripper' détectée(s) (attendu 2)")
