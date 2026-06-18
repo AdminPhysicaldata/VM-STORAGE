@@ -74,7 +74,7 @@ import verify_camera_sync
 import verify_integrity
 import diagnose_shuffle
 
-_PIPELINE_VERSION = 4  # bump à chaque changement de sémantique pour invalider le cache existant
+_PIPELINE_VERSION = 5  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
 _DEFAULT_WORKERS = os.cpu_count() or 4
 _PROGRESS_EVERY = 200
@@ -197,7 +197,11 @@ def _process_one(
             shuffle_report = diagnose_shuffle.analyze_session(session_dir)
             for finding in shuffle_report.findings:
                 lines.append(f"[shuffle/{finding.confidence}] {finding.camera.name} : {', '.join(finding.reasons)}")
-            is_clean = is_clean and not shuffle_report.is_contaminated
+            # Toute suspicion de shuffle fait échouer la session, même en confiance LOW
+            # (un seul signal) : sur ce rig, les sessions saines n'ont structurellement
+            # aucun écart temporel de ce type — un LOW n'est donc pas du bruit tolérable
+            # ici, contrairement à is_contaminated (qui ne se déclenche qu'à HIGH, ≥2 signaux).
+            is_clean = is_clean and not shuffle_report.findings
 
         if run_charuco and (session_dir / "cameras").is_dir():
             import detect_charuco_lr  # importé seulement si nécessaire (évite la dépendance opencv sinon)
