@@ -68,6 +68,47 @@ def _top_right(corners: np.ndarray) -> np.ndarray:
     return corners.reshape(4, 2)[1]
 
 
+# ─── Repli multi-passe (vidéo basse résolution / floue) ─────────────────────
+# Même constat que detect_charuco_lr.py : sur certaines sessions (640x480,
+# fort flou de mouvement), la détection simple échoue à décoder les
+# marqueurs même visibles à l'œil (0% de détection mesuré), ce qui rendait le
+# check left/right systématiquement "inconclusive". Un repli multi-passe
+# (CLAHE doux/fort, flou+CLAHE, accentuation) ramène la détection à ~41% sur
+# le cas observé. Coûteux (jusqu'à 5 passes), donc utilisé seulement quand la
+# détection simple ne trouve pas déjà les 2 marqueurs ciblés.
+_CLAHE_SOFT = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+_CLAHE_HARD = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
+_SHARPEN_KERNEL = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]], dtype=np.float32)
+
+
+def _detect_pair(gray: np.ndarray, detector, use_multipass: bool = True) -> dict:
+    """Détecte les marqueurs ArUco visibles, avec repli multi-prétraitements
+    si _MARKER_A et _MARKER_B ne sont pas trouvés ensemble du premier coup
+    (sauf si use_multipass=False — passe rapide pure, cf. analyze_session).
+    Retourne {id: corners (1,4,2)}."""
+    corners, ids, _ = detector.detectMarkers(gray)
+    found: dict = {}
+    if ids is not None:
+        for c, mid in zip(corners, ids.flatten()):
+            found[int(mid)] = c
+    if not use_multipass or (_MARKER_A in found and _MARKER_B in found):
+        return found
+
+    for img in (
+        _CLAHE_SOFT.apply(gray),
+        _CLAHE_HARD.apply(gray),
+        _CLAHE_SOFT.apply(cv2.GaussianBlur(gray, (3, 3), 0)),
+        cv2.filter2D(gray, -1, _SHARPEN_KERNEL).clip(0, 255).astype(np.uint8),
+    ):
+        c2, ids2, _ = detector.detectMarkers(img)
+        if ids2 is not None:
+            for c, mid in zip(c2, ids2.flatten()):
+                found.setdefault(int(mid), c)
+        if _MARKER_A in found and _MARKER_B in found:
+            break
+    return found
+
+
 def _load_grid_timestamps(resampled_path: Path, cam_key: str) -> Optional[list[float]]:
     """Lit cameras/resampled_30hz.jsonl : une ligne == une frame de la vidéo
     encodée (contrairement à cameras/{cam}.jsonl qui capture à un fps brut
@@ -107,9 +148,17 @@ def _fallback_camera_timestamps(jsonl_path: Path) -> list[float]:
     return ts
 
 
-def _track_marker_distance(video_path: Path, ts_list: list[float], detector) -> tuple[np.ndarray, np.ndarray]:
+def _track_marker_distance(
+    video_path: Path, ts_list: list[float], detector, use_multipass: bool = False,
+) -> tuple[np.ndarray, np.ndarray]:
     """Distance pixel entre les coins haut-droit des marqueurs 244 et 255,
-    pour chaque frame où les deux sont détectés simultanément."""
+    pour chaque frame où les deux sont détectés simultanément.
+
+    use_multipass=False (par défaut) : détection simple uniquement — passe
+    rapide sur toute la vidéo. analyze_session() ne réessaie en multi-passe
+    (use_multipass=True, bien plus lent) que si cette première passe ne
+    suffit pas à trancher — pas question de payer ce coût sur chaque vidéo
+    alors que la plupart se résolvent déjà avec la détection simple."""
     cap = cv2.VideoCapture(str(video_path))
     if not cap.isOpened():
         return np.array([]), np.array([])
@@ -120,14 +169,12 @@ def _track_marker_distance(video_path: Path, ts_list: list[float], detector) -> 
         if not ok:
             break
         gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-        corners, ids, _ = detector.detectMarkers(gray)
-        if ids is not None:
-            flat = ids.flatten().tolist()
-            if _MARKER_A in flat and _MARKER_B in flat and n < len(ts_list):
-                tr_a = _top_right(corners[flat.index(_MARKER_A)])
-                tr_b = _top_right(corners[flat.index(_MARKER_B)])
-                times.append(ts_list[n])
-                dists.append(float(np.linalg.norm(tr_a - tr_b)))
+        found = _detect_pair(gray, detector, use_multipass=use_multipass)
+        if _MARKER_A in found and _MARKER_B in found and n < len(ts_list):
+            tr_a = _top_right(found[_MARKER_A])
+            tr_b = _top_right(found[_MARKER_B])
+            times.append(ts_list[n])
+            dists.append(float(np.linalg.norm(tr_a - tr_b)))
         n += 1
     cap.release()
     return np.array(times), np.array(dists)
@@ -236,13 +283,10 @@ def _read_frame_at(cap: "cv2.VideoCapture", frame_idx: int, lookback: int = _QUI
 
 def _detect_pair_distance(frame, detector) -> Optional[float]:
     gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-    corners, ids, _ = detector.detectMarkers(gray)
-    if ids is None:
-        return None
-    flat = ids.flatten().tolist()
-    if _MARKER_A in flat and _MARKER_B in flat:
-        tr_a = _top_right(corners[flat.index(_MARKER_A)])
-        tr_b = _top_right(corners[flat.index(_MARKER_B)])
+    found = _detect_pair(gray, detector)
+    if _MARKER_A in found and _MARKER_B in found:
+        tr_a = _top_right(found[_MARKER_A])
+        tr_b = _top_right(found[_MARKER_B])
         return float(np.linalg.norm(tr_a - tr_b))
     return None
 
@@ -443,7 +487,36 @@ class SessionResult:
         return "same" if score_same > score_swap else "swap"
 
 
+def _full_scan_result(
+    session_dir: Path, left_video: Path, right_video: Path,
+    ts_left: list, ts_right: list, sl_t, sl_v, sr_t, sr_v,
+    detector, use_multipass: bool,
+) -> SessionResult:
+    t_left, d_left = _track_marker_distance(left_video, ts_left, detector, use_multipass=use_multipass)
+    t_right, d_right = _track_marker_distance(right_video, ts_right, detector, use_multipass=use_multipass)
+
+    r_LL, lag_LL = _best_lag_corr(t_left, d_left, sl_t, sl_v)
+    r_LR, _ = _best_lag_corr(t_left, d_left, sr_t, sr_v)
+    r_RL, _ = _best_lag_corr(t_right, d_right, sl_t, sl_v)
+    r_RR, lag_RR = _best_lag_corr(t_right, d_right, sr_t, sr_v)
+
+    return SessionResult(
+        name=session_dir.name,
+        n_left=len(t_left), n_right=len(t_right),
+        r_LL=r_LL, r_RR=r_RR, r_LR=r_LR, r_RL=r_RL,
+        lag_LL=lag_LL, lag_RR=lag_RR,
+        sufficient_left=_data_sufficient(t_left),
+        sufficient_right=_data_sufficient(t_right),
+    )
+
+
 def analyze_session(session_dir: Path) -> Optional[SessionResult]:
+    """Scan complet (toute la vidéo, contrairement à quick_analyze_session) —
+    déjà la passe coûteuse de secours quand l'échantillonnage rapide ne
+    suffit pas. Optimisation : une PREMIÈRE passe en détection simple
+    (use_multipass=False, rapide) ; le repli multi-passe — bien plus lent —
+    n'est tenté que si cette première passe reste inconclusive. La plupart
+    des vidéos n'ont pas besoin du repli, pas question de le payer partout."""
     cam_dir = session_dir / "cameras"
     sens_dir = session_dir / "sensors"
     left_video, right_video = cam_dir / "left.mp4", cam_dir / "right.mp4"
@@ -461,24 +534,19 @@ def analyze_session(session_dir: Path) -> Optional[SessionResult]:
         ts_right = _fallback_camera_timestamps(cam_dir / "right.jsonl")
 
     detector = _make_detector()
-    t_left, d_left = _track_marker_distance(left_video, ts_left, detector)
-    t_right, d_right = _track_marker_distance(right_video, ts_right, detector)
     sl_t, sl_v = _sensor_opening(left_sensor)
     sr_t, sr_v = _sensor_opening(right_sensor)
 
-    r_LL, lag_LL = _best_lag_corr(t_left, d_left, sl_t, sl_v)
-    r_LR, _ = _best_lag_corr(t_left, d_left, sr_t, sr_v)
-    r_RL, _ = _best_lag_corr(t_right, d_right, sl_t, sl_v)
-    r_RR, lag_RR = _best_lag_corr(t_right, d_right, sr_t, sr_v)
-
-    return SessionResult(
-        name=session_dir.name,
-        n_left=len(t_left), n_right=len(t_right),
-        r_LL=r_LL, r_RR=r_RR, r_LR=r_LR, r_RL=r_RL,
-        lag_LL=lag_LL, lag_RR=lag_RR,
-        sufficient_left=_data_sufficient(t_left),
-        sufficient_right=_data_sufficient(t_right),
+    result = _full_scan_result(
+        session_dir, left_video, right_video, ts_left, ts_right, sl_t, sl_v, sr_t, sr_v,
+        detector, use_multipass=False,
     )
+    if result.verdict.startswith("inconclusive"):
+        result = _full_scan_result(
+            session_dir, left_video, right_video, ts_left, ts_right, sl_t, sl_v, sr_t, sr_v,
+            detector, use_multipass=True,
+        )
+    return result
 
 
 def plot_session(session_dir: Path, out_path: Path) -> None:

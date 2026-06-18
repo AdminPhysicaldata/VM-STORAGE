@@ -34,10 +34,13 @@ Dépendances : opencv-contrib-python
 from __future__ import annotations
 
 import argparse
+import functools
 import json
 import sys
 from dataclasses import dataclass
 from pathlib import Path
+
+import numpy as np
 
 try:
     import cv2
@@ -70,11 +73,60 @@ def _make_detector(dict_name: str):
         return lambda gray: cv2.aruco.detectMarkers(gray, aruco_dict, parameters=params)[1]
 
 
+# ─── Repli multi-passe (vidéo basse résolution / floue) ─────────────────────
+#
+# Constat (sessions 640x480 à fort flou de mouvement, cf. incident pipeline) :
+# la détection simple échoue à décoder le motif des marqueurs même quand ils
+# sont visibles à l'œil, faisant passer un gripper réel pour "head" (0% de
+# détection) — exactement le cas dangereux puisqu'un mismatch peut déclencher
+# un renommage. Un repli multi-prétraitements (CLAHE doux/fort, flou+CLAHE,
+# accentuation — repris de gripper_tracking.py) fait passer la détection de
+# 0% à 41% sur le cas observé. Coûteux (5 passes), donc utilisé seulement
+# quand la détection simple ne trouve pas déjà les 2 marqueurs.
+
+_CLAHE_SOFT = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+_CLAHE_HARD = cv2.createCLAHE(clipLimit=4.0, tileGridSize=(4, 4))
+_SHARPEN_KERNEL = np.array([[-1, -1, -1], [-1, 9, -1], [-1, -1, -1]], dtype=np.float32)
+
+
+@functools.lru_cache(maxsize=4)
+def _make_raw_detector(dict_name: str):
+    aruco_dict = cv2.aruco.getPredefinedDictionary(getattr(cv2.aruco, dict_name))
+    params = cv2.aruco.DetectorParameters()
+    return cv2.aruco.ArucoDetector(aruco_dict, params)
+
+
+def _detect_multipass_ids(gray: np.ndarray, dict_name: str) -> set[int]:
+    detector = _make_raw_detector(dict_name)
+    passes = [
+        gray,
+        _CLAHE_SOFT.apply(gray),
+        _CLAHE_HARD.apply(gray),
+        _CLAHE_SOFT.apply(cv2.GaussianBlur(gray, (3, 3), 0)),
+        cv2.filter2D(gray, -1, _SHARPEN_KERNEL).clip(0, 255).astype(np.uint8),
+    ]
+    found: set[int] = set()
+    for img in passes:
+        _, ids, _ = detector.detectMarkers(img)
+        if ids is not None:
+            found.update(int(i) for i in ids.flatten())
+    return found
+
+
 # ─── Échantillonnage : ratio de frames où les 2 marqueurs sont visibles ─────
 
-def _gripper_marker_ratio(path: Path, detector, sample_fps: float) -> float | None:
+def _gripper_marker_ratio(
+    path: Path, detector, sample_fps: float, dict_name: str = _DEFAULT_DICT,
+    use_multipass: bool = False,
+) -> float | None:
     """Retourne la fraction de frames échantillonnées où id244 ET id255 sont
-    détectés ensemble, ou None si la vidéo est illisible/corrompue."""
+    détectés ensemble, ou None si la vidéo est illisible/corrompue.
+
+    use_multipass=False (passe rapide, par défaut) : détection simple
+    uniquement — suffisant et bien plus rapide dès que le résultat n'est pas
+    ambigu. use_multipass=True (repli) : ajoute le prétraitement multi-passe
+    sur les frames où la détection simple échoue — coûteux, à réserver aux
+    vidéos dont le premier résultat est ambigu ou suspect (cf. analyze_session)."""
     cap = cv2.VideoCapture(str(path))
     if not cap.isOpened():
         return None
@@ -93,10 +145,11 @@ def _gripper_marker_ratio(path: Path, detector, sample_fps: float) -> float | No
                 gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
                 ids = detector(gray)
                 total += 1
-                if ids is not None:
-                    flat = ids.flatten().tolist()
-                    if _MARKER_IDS[0] in flat and _MARKER_IDS[1] in flat:
-                        both += 1
+                flat = set(ids.flatten().tolist()) if ids is not None else set()
+                if use_multipass and not (_MARKER_IDS[0] in flat and _MARKER_IDS[1] in flat):
+                    flat |= _detect_multipass_ids(gray, dict_name)
+                if _MARKER_IDS[0] in flat and _MARKER_IDS[1] in flat:
+                    both += 1
         idx += 1
     cap.release()
     return (both / total) if total else None
@@ -134,14 +187,28 @@ def analyze_session(
     dict_name: str = _DEFAULT_DICT,
     sample_fps: float = _SAMPLE_FPS,
 ) -> list[VideoFinding]:
+    """Passe rapide (détection simple) sur toutes les vidéos, puis repli
+    multi-passe — bien plus coûteux — UNIQUEMENT sur celles dont le résultat
+    rapide est ambigu ou contredit le nom (mismatch). Sur une vidéo dont le
+    résultat est déjà net (vrai gripper bien détecté, vraie head jamais
+    détectée), refaire l'analyse en multi-passe n'aurait rien changé — ne pas
+    payer ce coût systématiquement est l'optimisation qui fait la différence
+    en volume (cf. incident pipeline : multi-passe partout = beaucoup plus
+    lent pour un gain nul sur les sessions déjà sans ambiguïté)."""
     cameras_dir = session_dir / "cameras"
     detector = _make_detector(dict_name)
 
     findings: list[VideoFinding] = []
     for video_path in sorted(cameras_dir.glob("*.mp4")):
         name = video_path.stem
-        ratio = _gripper_marker_ratio(video_path, detector, sample_fps)
+        ratio = _gripper_marker_ratio(video_path, detector, sample_fps, dict_name, use_multipass=False)
         role = _classify(ratio)
+
+        needs_recheck = role == "ambiguous" or (role in ("gripper", "head") and role != expected_role(name))
+        if needs_recheck:
+            ratio = _gripper_marker_ratio(video_path, detector, sample_fps, dict_name, use_multipass=True)
+            role = _classify(ratio)
+
         findings.append(VideoFinding(current_name=name, role=role, ratio=ratio or 0.0))
     return findings
 

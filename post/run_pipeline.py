@@ -18,15 +18,23 @@ Chaîne, pour chaque session, les contrôles dans cet ordre :
                            ne voit jamais les pinces et que "left"/"right" les
                            voient toujours (ne tente PAS de distinguer left de
                            right entre eux : signal trop bruité en valeur
-                           absolue, voir le docstring de detect_charuco_lr.py)
+                           absolue, voir le docstring de detect_charuco_lr.py).
+                           "ambiguous" (zone grise, fréquent sur vidéo basse
+                           résolution/floue) n'est PAS bloquant — seul un
+                           "mismatch" net ou une vidéo illisible le sont.
   6. detect_gripper_lr_marker_distance — tranche ce que l'étape 5 ne peut pas :
-                           corrèle (~10 frames ciblées) la distance des
-                           marqueurs 244/255 à Opening_width (sensors/) pour
-                           confirmer que cameras/left.mp4 correspond bien à
-                           sensors/left.jsonl (et idem right) — r≈0.99 sur le
-                           bon appariement. "swap" corrigé automatiquement en
-                           --apply, "inconclusive" (signal insuffisant) signalé
-                           en anomalie plutôt que présumé correct.
+                           corrèle la distance des marqueurs 244/255 à
+                           Opening_width (sensors/) pour confirmer que
+                           cameras/left.mp4 correspond bien à sensors/left.jsonl
+                           (et idem right) — r≈0.99 sur le bon appariement.
+                           Passe rapide (~10 frames ciblées) puis, si
+                           inconclusive, ESCALADE vers un scan complet (toute
+                           la vidéo) avant de conclure — un échantillonnage
+                           insuffisant ne prouve rien sur une vidéo difficile à
+                           analyser. Seul un "swap" confiant (rapide ou complet)
+                           rend la session anormale (corrigé auto en --apply) ;
+                           "inconclusive" même après le scan complet reste OK :
+                           l'absence de preuve n'est pas une preuve d'inversion.
 
 Conçu pour tourner sur des dizaines de milliers de sessions :
 
@@ -82,7 +90,7 @@ import verify_camera_sync
 import verify_integrity
 import diagnose_shuffle
 
-_PIPELINE_VERSION = 6  # bump à chaque changement de sémantique pour invalider le cache existant
+_PIPELINE_VERSION = 7  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
 _DEFAULT_WORKERS = os.cpu_count() or 4
 _PROGRESS_EVERY = 200
@@ -217,7 +225,13 @@ def _process_one(
         if run_charuco and (session_dir / "cameras").is_dir():
             import detect_charuco_lr  # importé seulement si nécessaire (évite la dépendance opencv sinon)
             findings = detect_charuco_lr.analyze_session(session_dir, sample_fps=charuco_sample_fps)
-            charuco_anomaly = any(f.mismatch or f.role in ("unreadable", "ambiguous") for f in findings)
+            # "ambiguous" (ratio entre les deux seuils) n'est PAS bloquant : sur des vidéos
+            # basse résolution / avec flou de mouvement, le taux de détection des marqueurs
+            # tombe naturellement dans cette zone grise même pour un gripper correctement
+            # nommé — ça ne veut pas dire que le nommage est faux, juste que le signal est
+            # faible. Seul un "mismatch" net (le rôle détecté contredit le nom) ou une vidéo
+            # illisible restent des preuves suffisantes pour bloquer la session.
+            charuco_anomaly = any(f.mismatch or f.role == "unreadable" for f in findings)
             if charuco_anomaly and apply:
                 detect_charuco_lr.apply_fix(session_dir, findings)
                 # Le renommage invalide l'empreinte ; on la recalcule pour le cache final.
@@ -231,25 +245,39 @@ def _process_one(
                 elif f.role == "unreadable":
                     lines.append(f"[charuco]   {f.current_name}.mp4 illisible/corrompue")
                 elif f.role == "ambiguous":
-                    lines.append(f"[charuco]   {f.current_name}.mp4 : ni clairement gripper ni clairement head")
+                    lines.append(f"[charuco/info] {f.current_name}.mp4 : ni clairement gripper ni clairement head (non bloquant)")
             is_clean = is_clean and not charuco_anomaly
 
         # Vérifie que cameras/left.mp4 et right.mp4 correspondent bien à
         # sensors/left.jsonl et right.jsonl (et pas l'inverse) : corrélation
-        # rapide (~10 frames ciblées) entre la distance des marqueurs ArUco
-        # 244/255 et Opening_width. Contrairement à detect_charuco_lr (qui ne
-        # tranche jamais ce point), ce signal est quasi parfait (r≈0.99) — donc
-        # ici on EXIGE "same", "swap" et "inconclusive" sont tous deux des anomalies :
-        # un swap confiant est corrigé automatiquement en --apply, un signal
-        # insuffisant (peu de mouvement d'ouverture) est signalé pour vérification
-        # manuelle plutôt que présumé correct.
+        # entre la distance des marqueurs ArUco 244/255 et Opening_width.
+        #
+        # Politique (révisée après un faux-positif massif sur un lot 640x480 à
+        # fort flou de mouvement où le taux de détection par frame est
+        # naturellement faible) :
+        #   1. Passe rapide (~10 frames ciblées, quick_analyze_session) — résout
+        #      la grande majorité des sessions en quelques secondes.
+        #   2. Si "inconclusive", ESCALADE vers le scan complet (analyze_session,
+        #      décode toute la vidéo) avant de conclure quoi que ce soit — un
+        #      échantillon de 10 frames qui échoue ne prouve rien sur une vidéo
+        #      difficile à analyser, il faut épuiser le signal disponible.
+        #   3. Seul un verdict confiant "swap" (passe rapide OU complète) rend la
+        #      session anormale — corrigé automatiquement en --apply. "same" et
+        #      "inconclusive" (même après le scan complet) sont traités comme OK :
+        #      l'absence de preuve n'est pas une preuve d'inversion.
         if run_lr_check and (session_dir / "cameras").is_dir() and (session_dir / "sensors").is_dir():
             import detect_gripper_lr_marker_distance as lr_check
             lr_result = lr_check.quick_analyze_session(session_dir, n_samples=lr_n_samples)
+            verdict = lr_result.verdict if lr_result is not None else None
+            escalated = False
+            if lr_result is not None and verdict.startswith("inconclusive"):
+                full_result = lr_check.analyze_session(session_dir)
+                if full_result is not None:
+                    lr_result, verdict, escalated = full_result, full_result.verdict, True
+
             if lr_result is None:
                 lines.append("[lr]        vidéos/capteurs left+right manquants — vérification ignorée")
             else:
-                verdict = lr_result.verdict
                 if verdict == "swap" and apply:
                     fix_log = lr_check.apply_swap_fix(session_dir)
                     lines.extend(f"[lr-fix]    {l}" for l in fix_log)
@@ -257,15 +285,18 @@ def _process_one(
                     # Re-vérifie après correction : la prochaine analyse doit voir "same".
                     lr_result = lr_check.quick_analyze_session(session_dir, n_samples=lr_n_samples)
                     verdict = lr_result.verdict if lr_result is not None else "inconclusive (échec post-correction)"
+                tag = "[lr/full]  " if escalated else "[lr]       "
                 if verdict == "swap":
-                    lines.append(
-                        f"[lr]        left/right probablement inversés "
-                        f"(r_same_left={lr_result.r_same_left:+.2f} r_same_right={lr_result.r_same_right:+.2f} "
-                        f"r_cross_left={lr_result.r_cross_left:+.2f} r_cross_right={lr_result.r_cross_right:+.2f})"
-                    )
+                    if hasattr(lr_result, "r_same_left"):  # QuickResult
+                        detail = (f"r_same_left={lr_result.r_same_left:+.2f} r_same_right={lr_result.r_same_right:+.2f} "
+                                  f"r_cross_left={lr_result.r_cross_left:+.2f} r_cross_right={lr_result.r_cross_right:+.2f}")
+                    else:  # SessionResult
+                        detail = (f"r_LL={lr_result.r_LL:+.2f} r_RR={lr_result.r_RR:+.2f} "
+                                  f"r_LR={lr_result.r_LR:+.2f} r_RL={lr_result.r_RL:+.2f}")
+                    lines.append(f"{tag} left/right probablement inversés ({detail})")
                 elif verdict != "same":
-                    lines.append(f"[lr]        {verdict}")
-                is_clean = is_clean and verdict == "same"
+                    lines.append(f"{tag} {verdict} (non bloquant)")
+                is_clean = is_clean and verdict != "swap"
 
         status = "OK" if is_clean else "ANOMALY"
         _save_cache(session_dir, fingerprint, config_key, status, lines)
