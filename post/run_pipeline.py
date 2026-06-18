@@ -278,15 +278,34 @@ def main() -> int:
     print(f"{total} sessions, {args.workers} workers, charuco={'ON' if run_charuco else 'OFF'}…\n")
 
     report_fh = args.report.open("w", encoding="utf-8") if args.report else None
-    to_move_clean: list[Path] = []
-    to_move_bad: list[Path] = []
     counts = {"OK": 0, "ANOMALY": 0, "ERROR": 0}
+    moved_clean = moved_bad = move_errors = 0
     cached_count = 0
     done = 0
     t0 = time.time()
 
+    def _move_done(fut, dest_label: str):
+        """Callback de fin de déplacement : compte le résultat sans jamais
+        faire planter la boucle principale si un move échoue (disque plein,
+        permissions...)."""
+        nonlocal moved_clean, moved_bad, move_errors
+        try:
+            fut.result()
+            if dest_label == "clean":
+                moved_clean += 1
+            else:
+                moved_bad += 1
+        except OSError as exc:
+            move_errors += 1
+            print(f"\n  [ERREUR déplacement {dest_label}] {exc}", file=sys.stderr)
+
     try:
-        with ProcessPoolExecutor(max_workers=args.workers) as pool:
+        # Pool de threads dédié aux déplacements : soumis au fil de l'eau pendant
+        # que le ProcessPoolExecutor continue d'analyser les sessions suivantes —
+        # une session en anomalie part en quarantaine dès qu'elle est détectée,
+        # pas seulement à la toute fin du run (visible en direct dans le dossier).
+        with ProcessPoolExecutor(max_workers=args.workers) as pool, \
+             ThreadPoolExecutor(max_workers=max(2, args.workers // 2)) as move_pool:
             futures = {
                 pool.submit(
                     _process_one, str(s), args.apply, run_charuco,
@@ -308,34 +327,28 @@ def main() -> int:
 
                 if result["status"] == "OK":
                     if args.move_clean:
-                        to_move_clean.append(session_dir)
+                        mv = move_pool.submit(shutil.move, str(session_dir), str(args.move_clean / session_dir.name))
+                        mv.add_done_callback(lambda f: _move_done(f, "clean"))
                 elif args.move_bad:
-                    to_move_bad.append(session_dir)
+                    mv = move_pool.submit(shutil.move, str(session_dir), str(args.move_bad / session_dir.name))
+                    mv.add_done_callback(lambda f: _move_done(f, "bad"))
 
                 if done % _PROGRESS_EVERY == 0 or done == total:
                     rate = done / max(time.time() - t0, 1e-6)
                     eta = (total - done) / rate if rate > 0 else 0
                     print(
                         f"  … {done}/{total}  ok={counts['OK']} anomalies={counts['ANOMALY']} "
-                        f"erreurs={counts['ERROR']} cache={cached_count}  "
+                        f"erreurs={counts['ERROR']} cache={cached_count} déplacées={moved_clean + moved_bad}  "
                         f"({rate:.1f} sessions/s, ETA {eta/60:.1f} min)",
                         end="\r",
                     )
+            # move_pool se ferme ici (context manager) : attend que tous les
+            # déplacements en attente se terminent avant de continuer.
     finally:
         if report_fh:
             report_fh.close()
 
     print()
-
-    if to_move_clean or to_move_bad:
-        print("\nDéplacement des sessions triées…")
-        with ThreadPoolExecutor(max_workers=args.workers) as pool:
-            futs = (
-                [pool.submit(shutil.move, str(s), str(args.move_clean / s.name)) for s in to_move_clean]
-                + [pool.submit(shutil.move, str(s), str(args.move_bad / s.name)) for s in to_move_bad]
-            )
-            for fut in as_completed(futs):
-                fut.result()
 
     elapsed = time.time() - t0
     print(f"\n{'─' * 50}")
@@ -345,9 +358,11 @@ def main() -> int:
     print(f"Anomalies          : {counts['ANOMALY']}")
     print(f"Erreurs            : {counts['ERROR']}")
     if args.move_clean:
-        print(f"Déplacées (clean)  : {len(to_move_clean)}")
+        print(f"Déplacées (clean)  : {moved_clean}")
     if args.move_bad:
-        print(f"Déplacées (bad)    : {len(to_move_bad)}")
+        print(f"Déplacées (bad)    : {moved_bad}")
+    if move_errors:
+        print(f"Échecs déplacement : {move_errors}")
     if not args.apply:
         print("\n(dry-run — relancez avec --apply pour corriger réellement les noms)")
     return 0
