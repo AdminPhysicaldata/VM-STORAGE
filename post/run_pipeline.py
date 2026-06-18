@@ -16,9 +16,17 @@ Chaîne, pour chaque session, les contrôles dans cet ordre :
                            (alignement temporel, durée jsonl + durée vidéo ffprobe)
   5. detect_charuco_lr  — vérifie via les marqueurs ArUco 244/255 que "head"
                            ne voit jamais les pinces et que "left"/"right" les
-                           voient toujours (ne tente plus de distinguer left
-                           de right entre eux : signal trop bruité, voir le
-                           docstring de detect_charuco_lr.py)
+                           voient toujours (ne tente PAS de distinguer left de
+                           right entre eux : signal trop bruité en valeur
+                           absolue, voir le docstring de detect_charuco_lr.py)
+  6. detect_gripper_lr_marker_distance — tranche ce que l'étape 5 ne peut pas :
+                           corrèle (~10 frames ciblées) la distance des
+                           marqueurs 244/255 à Opening_width (sensors/) pour
+                           confirmer que cameras/left.mp4 correspond bien à
+                           sensors/left.jsonl (et idem right) — r≈0.99 sur le
+                           bon appariement. "swap" corrigé automatiquement en
+                           --apply, "inconclusive" (signal insuffisant) signalé
+                           en anomalie plutôt que présumé correct.
 
 Conçu pour tourner sur des dizaines de milliers de sessions :
 
@@ -74,7 +82,7 @@ import verify_camera_sync
 import verify_integrity
 import diagnose_shuffle
 
-_PIPELINE_VERSION = 5  # bump à chaque changement de sémantique pour invalider le cache existant
+_PIPELINE_VERSION = 6  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
 _DEFAULT_WORKERS = os.cpu_count() or 4
 _PROGRESS_EVERY = 200
@@ -106,11 +114,12 @@ def _fingerprint(session_dir: Path) -> str:
     return sha1("|".join(parts).encode()).hexdigest()
 
 
-def _config_key(apply: bool, run_charuco: bool, charuco_sample_fps: float) -> str:
+def _config_key(apply: bool, run_charuco: bool, charuco_sample_fps: float,
+                 run_lr_check: bool, lr_n_samples: int) -> str:
     # NB : "apply" n'entre pas dans la clé — un résultat "OK" en dry-run reste
     # valide en mode --apply (rien à appliquer). Voir _process_one pour la
     # logique d'invalidation qui dépend du statut ET de apply.
-    return f"{_PIPELINE_VERSION}:{run_charuco}:{charuco_sample_fps}"
+    return f"{_PIPELINE_VERSION}:{run_charuco}:{charuco_sample_fps}:{run_lr_check}:{lr_n_samples}"
 
 
 def _load_cache(session_dir: Path, fingerprint: str, config_key: str) -> dict | None:
@@ -145,13 +154,15 @@ def _process_one(
     run_charuco: bool,
     charuco_sample_fps: float,
     force: bool,
+    run_lr_check: bool = True,
+    lr_n_samples: int = 10,
 ) -> dict:
     """Tout ce qui touche une session, isolé pour tourner dans un worker
     séparé. Ne lève jamais — toute exception est convertie en statut ERROR
     pour ne jamais faire tomber le pool sur une session pourrie."""
     session_dir = Path(session_dir_str)
     name = session_dir.name
-    config_key = _config_key(apply, run_charuco, charuco_sample_fps)
+    config_key = _config_key(apply, run_charuco, charuco_sample_fps, run_lr_check, lr_n_samples)
 
     try:
         fingerprint = _fingerprint(session_dir)
@@ -223,6 +234,39 @@ def _process_one(
                     lines.append(f"[charuco]   {f.current_name}.mp4 : ni clairement gripper ni clairement head")
             is_clean = is_clean and not charuco_anomaly
 
+        # Vérifie que cameras/left.mp4 et right.mp4 correspondent bien à
+        # sensors/left.jsonl et right.jsonl (et pas l'inverse) : corrélation
+        # rapide (~10 frames ciblées) entre la distance des marqueurs ArUco
+        # 244/255 et Opening_width. Contrairement à detect_charuco_lr (qui ne
+        # tranche jamais ce point), ce signal est quasi parfait (r≈0.99) — donc
+        # ici on EXIGE "same", "swap" et "inconclusive" sont tous deux des anomalies :
+        # un swap confiant est corrigé automatiquement en --apply, un signal
+        # insuffisant (peu de mouvement d'ouverture) est signalé pour vérification
+        # manuelle plutôt que présumé correct.
+        if run_lr_check and (session_dir / "cameras").is_dir() and (session_dir / "sensors").is_dir():
+            import detect_gripper_lr_marker_distance as lr_check
+            lr_result = lr_check.quick_analyze_session(session_dir, n_samples=lr_n_samples)
+            if lr_result is None:
+                lines.append("[lr]        vidéos/capteurs left+right manquants — vérification ignorée")
+            else:
+                verdict = lr_result.verdict
+                if verdict == "swap" and apply:
+                    fix_log = lr_check.apply_swap_fix(session_dir)
+                    lines.extend(f"[lr-fix]    {l}" for l in fix_log)
+                    fingerprint = _fingerprint(session_dir)
+                    # Re-vérifie après correction : la prochaine analyse doit voir "same".
+                    lr_result = lr_check.quick_analyze_session(session_dir, n_samples=lr_n_samples)
+                    verdict = lr_result.verdict if lr_result is not None else "inconclusive (échec post-correction)"
+                if verdict == "swap":
+                    lines.append(
+                        f"[lr]        left/right probablement inversés "
+                        f"(r_same_left={lr_result.r_same_left:+.2f} r_same_right={lr_result.r_same_right:+.2f} "
+                        f"r_cross_left={lr_result.r_cross_left:+.2f} r_cross_right={lr_result.r_cross_right:+.2f})"
+                    )
+                elif verdict != "same":
+                    lines.append(f"[lr]        {verdict}")
+                is_clean = is_clean and verdict == "same"
+
         status = "OK" if is_clean else "ANOMALY"
         _save_cache(session_dir, fingerprint, config_key, status, lines)
         return {"name": name, "status": status, "lines": lines, "cached": False}
@@ -254,6 +298,10 @@ def main() -> int:
                    help="Sauter l'étape charuco (coûteuse, nécessite opencv)")
     p.add_argument("--charuco-sample-fps", type=float, default=2.0,
                    help="Fréquence (Hz) d'échantillonnage vidéo de detect_charuco_lr (défaut : 2.0)")
+    p.add_argument("--skip-lr-check", action="store_true",
+                   help="Sauter la vérification left/right (corrélation marqueurs 244/255 ↔ Opening_width, nécessite opencv)")
+    p.add_argument("--lr-n-samples", type=int, default=10, metavar="N",
+                   help="Nombre de frames échantillonnées pour la vérification left/right (défaut : 10)")
     p.add_argument("--move-clean", type=Path, metavar="DEST",
                    help="Déplacer les sessions propres dans ce répertoire")
     p.add_argument("--move-bad", type=Path, metavar="DEST",
@@ -268,11 +316,13 @@ def main() -> int:
     args = p.parse_args()
 
     run_charuco = not args.skip_charuco
+    run_lr_check = not args.skip_lr_check
 
     if args.session:
         session_dir = args.session.resolve()
         result = _process_one(
-            str(session_dir), args.apply, run_charuco, args.charuco_sample_fps, force=True
+            str(session_dir), args.apply, run_charuco, args.charuco_sample_fps, force=True,
+            run_lr_check=run_lr_check, lr_n_samples=args.lr_n_samples,
         )
         _print_result(result, verbose=True)
         return 0
@@ -295,7 +345,8 @@ def main() -> int:
         args.move_bad.mkdir(parents=True, exist_ok=True)
 
     total = len(sessions)
-    print(f"{total} sessions, {args.workers} workers, charuco={'ON' if run_charuco else 'OFF'}…\n")
+    print(f"{total} sessions, {args.workers} workers, charuco={'ON' if run_charuco else 'OFF'}, "
+          f"lr-check={'ON' if run_lr_check else 'OFF'}…\n")
 
     report_fh = args.report.open("w", encoding="utf-8") if args.report else None
     counts = {"OK": 0, "ANOMALY": 0, "ERROR": 0}
@@ -330,6 +381,7 @@ def main() -> int:
                 pool.submit(
                     _process_one, str(s), args.apply, run_charuco,
                     args.charuco_sample_fps, args.force,
+                    run_lr_check, args.lr_n_samples,
                 ): s
                 for s in sessions
             }

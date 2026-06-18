@@ -43,6 +43,9 @@ except ImportError as exc:
     print(f"Dépendance manquante : {exc}\n  uv add opencv-contrib-python", file=sys.stderr)
     raise SystemExit(1)
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+from fix_camera_names import _replace_in_json, fix_resampled_jsonl  # réutilisés pour appliquer un swap
+
 _MARKER_A, _MARKER_B = 244, 255
 _DICT_NAME = "DICT_4X4_1000"
 _MAX_LAG_SEC = 1.0
@@ -184,7 +187,7 @@ def _data_sufficient(t: np.ndarray) -> bool:
 # ═════════════════════════════════════════════════════════════════════════
 
 _QUICK_SEEK_LOOKBACK = 8     # frames de marge avant la cible, pour un seek fiable même sans keyframe exact
-_QUICK_RETRY_RADIUS = 2      # si les 2 marqueurs ne sont pas détectés à la frame visée, essaie ±1, ±2
+_QUICK_RETRY_RADIUS = 5      # si les 2 marqueurs ne sont pas détectés à la frame visée, essaie ±1..±5
 
 
 def _select_diverse_indices(values: np.ndarray, n: int) -> list[int]:
@@ -308,7 +311,7 @@ class QuickResult:
     def verdict(self) -> str:
         min_found = min(self.n_left_found, self.n_right_found)
         min_requested = min(self.n_left_requested, self.n_right_requested)
-        if min_found < max(4, 0.6 * min_requested):  # moins de 60% des échantillons demandés exploitables
+        if min_found < max(4, 0.5 * min_requested):  # moins de 50% des échantillons demandés exploitables
             return "inconclusive (trop peu de frames exploitables)"
         score_same = abs(self.r_same_left) + abs(self.r_same_right)
         score_swap = abs(self.r_cross_left) + abs(self.r_cross_right)
@@ -366,6 +369,51 @@ def quick_analyze_session(session_dir: Path, n_samples: int = 10) -> Optional[Qu
         r_same_left=r_same_left, r_same_right=r_same_right,
         r_cross_left=r_cross_left, r_cross_right=r_cross_right,
     )
+
+
+def apply_swap_fix(session_dir: Path) -> list[str]:
+    """Échange cameras/left.mp4↔right.mp4 (+ .jsonl) quand quick_analyze_session
+    a tranché "swap" avec confiance. Ne touche JAMAIS sensors/ : c'est la
+    vérité-terrain (capteur identifié par le firmware) qui a servi à détecter
+    le swap, donc c'est cameras/ qu'on aligne dessus, pas l'inverse.
+
+    Propage aussi le renommage à cameras/resampled_30hz.jsonl (sinon la
+    session redevient désynchronisée — cf. verify_camera_sync.py) et à
+    config.json/analysis.json. Retourne le journal des actions effectuées."""
+    cam_dir = session_dir / "cameras"
+    renames = {"left": "right", "right": "left"}
+    tmp_suffix = ".tmp_lr_swap"
+    log: list[str] = []
+
+    for old in renames:
+        for ext in (".mp4", ".jsonl"):
+            src = cam_dir / f"{old}{ext}"
+            if src.exists():
+                src.rename(cam_dir / f"{old}{ext}{tmp_suffix}")
+    for old, new in renames.items():
+        for ext in (".mp4", ".jsonl"):
+            src = cam_dir / f"{old}{ext}{tmp_suffix}"
+            if src.exists():
+                src.rename(cam_dir / f"{new}{ext}")
+        log.append(f"rename {old} → {new}")
+
+    if fix_resampled_jsonl(cam_dir / "resampled_30hz.jsonl", renames, dry_run=False):
+        log.append("update content resampled_30hz.jsonl")
+
+    for json_name in ("config.json", "analysis.json"):
+        path = session_dir / json_name
+        if not path.is_file():
+            continue
+        try:
+            obj = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        new_obj = _replace_in_json(obj, renames)
+        if new_obj != obj:
+            path.write_text(json.dumps(new_obj, ensure_ascii=False, indent=2), encoding="utf-8")
+            log.append(f"update {json_name}")
+
+    return log
 
 
 @dataclass
