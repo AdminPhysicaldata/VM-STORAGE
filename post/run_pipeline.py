@@ -8,8 +8,11 @@ Chaîne, pour chaque session, les contrôles dans cet ordre :
                            (+ détecte les fichiers présents mais corrompus)
   3. diagnose_shuffle    — détecte les sessions contaminées par un autre device
                            (alignement temporel, durée jsonl + durée vidéo ffprobe)
-  4. detect_charuco_lr  — détecte une inversion left/right via les marqueurs
-                           ArUco 244/255 + corrélation avec Opening_width
+  4. detect_charuco_lr  — vérifie via les marqueurs ArUco 244/255 que "head"
+                           ne voit jamais les pinces et que "left"/"right" les
+                           voient toujours (ne tente plus de distinguer left
+                           de right entre eux : signal trop bruité, voir le
+                           docstring de detect_charuco_lr.py)
 
 Conçu pour tourner sur des dizaines de milliers de sessions :
 
@@ -64,7 +67,7 @@ import fix_camera_names
 import verify_integrity
 import diagnose_shuffle
 
-_PIPELINE_VERSION = 2
+_PIPELINE_VERSION = 3  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
 _DEFAULT_WORKERS = os.cpu_count() or 4
 _PROGRESS_EVERY = 200
@@ -96,11 +99,11 @@ def _fingerprint(session_dir: Path) -> str:
     return sha1("|".join(parts).encode()).hexdigest()
 
 
-def _config_key(apply: bool, run_charuco: bool, classify_fps: float, curve_fps: float) -> str:
+def _config_key(apply: bool, run_charuco: bool, charuco_sample_fps: float) -> str:
     # NB : "apply" n'entre pas dans la clé — un résultat "OK" en dry-run reste
     # valide en mode --apply (rien à appliquer). Voir _process_one pour la
     # logique d'invalidation qui dépend du statut ET de apply.
-    return f"{_PIPELINE_VERSION}:{run_charuco}:{classify_fps}:{curve_fps}"
+    return f"{_PIPELINE_VERSION}:{run_charuco}:{charuco_sample_fps}"
 
 
 def _load_cache(session_dir: Path, fingerprint: str, config_key: str) -> dict | None:
@@ -133,8 +136,7 @@ def _process_one(
     session_dir_str: str,
     apply: bool,
     run_charuco: bool,
-    classify_fps: float,
-    curve_fps: float,
+    charuco_sample_fps: float,
     force: bool,
 ) -> dict:
     """Tout ce qui touche une session, isolé pour tourner dans un worker
@@ -142,7 +144,7 @@ def _process_one(
     pour ne jamais faire tomber le pool sur une session pourrie."""
     session_dir = Path(session_dir_str)
     name = session_dir.name
-    config_key = _config_key(apply, run_charuco, classify_fps, curve_fps)
+    config_key = _config_key(apply, run_charuco, charuco_sample_fps)
 
     try:
         fingerprint = _fingerprint(session_dir)
@@ -183,31 +185,22 @@ def _process_one(
 
         if run_charuco and (session_dir / "cameras").is_dir():
             import detect_charuco_lr  # importé seulement si nécessaire (évite la dépendance opencv sinon)
-            findings = detect_charuco_lr.analyze_session(session_dir, classify_fps=classify_fps, curve_fps=curve_fps)
-            charuco_anomaly = any(
-                f.inferred_name and f.inferred_name != f.current_name for f in findings
-            ) or sum(1 for f in findings if f.role == "gripper") not in (0, 2) or any(
-                f.role == "unreadable" for f in findings
-            )
+            findings = detect_charuco_lr.analyze_session(session_dir, sample_fps=charuco_sample_fps)
+            charuco_anomaly = any(f.mismatch or f.role in ("unreadable", "ambiguous") for f in findings)
             if charuco_anomaly and apply:
                 detect_charuco_lr.apply_fix(session_dir, findings)
                 # Le renommage invalide l'empreinte ; on la recalcule pour le cache final.
                 fingerprint = _fingerprint(session_dir)
             for f in findings:
-                if f.inferred_name and f.inferred_name != f.current_name:
+                if f.mismatch:
                     lines.append(
-                        f"[charuco]   {f.current_name}.mp4 mal nommée → identité probable : {f.inferred_name}"
+                        f"[charuco]   {f.current_name}.mp4 incohérent : nommée '{f.current_name}' "
+                        f"mais le contenu correspond à '{f.role}'"
                     )
-                if f.role == "unreadable":
+                elif f.role == "unreadable":
                     lines.append(f"[charuco]   {f.current_name}.mp4 illisible/corrompue")
-                if f.role == "gripper" and not f.confident:
-                    lines.append(
-                        f"[charuco]   {f.current_name}.mp4 : signal trop faible pour confirmer left/right "
-                        f"(pas une anomalie, juste non vérifié)"
-                    )
-            n_gripper = sum(1 for f in findings if f.role == "gripper")
-            if n_gripper not in (0, 2):
-                lines.append(f"[charuco]   {n_gripper} vidéo(s) 'gripper' détectée(s) (attendu 2)")
+                elif f.role == "ambiguous":
+                    lines.append(f"[charuco]   {f.current_name}.mp4 : ni clairement gripper ni clairement head")
             is_clean = is_clean and not charuco_anomaly
 
         status = "OK" if is_clean else "ANOMALY"
@@ -239,10 +232,8 @@ def main() -> int:
                    help="Appliquer réellement les corrections de noms (par défaut : dry-run)")
     p.add_argument("--skip-charuco", action="store_true",
                    help="Sauter l'étape charuco (coûteuse, nécessite opencv)")
-    p.add_argument("--classify-fps", type=float, default=1.0,
-                   help="Fréquence (Hz) de la passe légère head/gripper de detect_charuco_lr (défaut : 1.0)")
-    p.add_argument("--curve-fps", type=float, default=5.0,
-                   help="Fréquence (Hz) de la passe dense de detect_charuco_lr (défaut : 5.0)")
+    p.add_argument("--charuco-sample-fps", type=float, default=2.0,
+                   help="Fréquence (Hz) d'échantillonnage vidéo de detect_charuco_lr (défaut : 2.0)")
     p.add_argument("--move-clean", type=Path, metavar="DEST",
                    help="Déplacer les sessions propres dans ce répertoire")
     p.add_argument("--move-bad", type=Path, metavar="DEST",
@@ -261,7 +252,7 @@ def main() -> int:
     if args.session:
         session_dir = args.session.resolve()
         result = _process_one(
-            str(session_dir), args.apply, run_charuco, args.classify_fps, args.curve_fps, force=True
+            str(session_dir), args.apply, run_charuco, args.charuco_sample_fps, force=True
         )
         _print_result(result, verbose=True)
         return 0
@@ -299,7 +290,7 @@ def main() -> int:
             futures = {
                 pool.submit(
                     _process_one, str(s), args.apply, run_charuco,
-                    args.classify_fps, args.curve_fps, args.force,
+                    args.charuco_sample_fps, args.force,
                 ): s
                 for s in sessions
             }
