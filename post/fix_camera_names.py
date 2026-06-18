@@ -43,7 +43,13 @@ from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 _DEFAULT_EXPECTED = {"left", "right", "head"}
-_IGNORE_FILES = {"resample_report.json", "resampled_30hz.jsonl"}
+_RESAMPLED_FILENAME = "resampled_30hz.jsonl"
+# resample_report.json n'a aucune référence de nom de caméra (juste des stats) → rien à corriger.
+# resampled_30hz.jsonl EN A (clés "frames"."left"/"right"/"head" + chemins "file") mais c'est du
+# JSONL (1 objet par ligne), pas un JSON simple : on l'exclut du scan générique de noms ET du
+# correcteur JSON générique (_fix_json_file ferait json.loads() sur tout le fichier → erreur),
+# et on le corrige avec son propre correcteur dédié _fix_resampled_jsonl() dans fix().
+_IGNORE_FILES = {"resample_report.json", _RESAMPLED_FILENAME}
 _VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov"}
 _STRIP_PREFIXES = ("fix_", "new_", "old_", "temp_", "bad_", "test_")
 _DEFAULT_WORKERS = min(16, (os.cpu_count() or 4) * 2)
@@ -124,6 +130,76 @@ def _replace_in_json(obj, renames: dict[str, str]):
     if isinstance(obj, dict):
         return {k: _replace_in_json(v, renames) for k, v in obj.items()}
     return obj
+
+
+# ─── Correction dédiée de cameras/resampled_30hz.jsonl ───────────────────────
+
+_RESAMPLED_FILE_PATH_RE = re.compile(r"(/cameras/)([^/]+)(/)")
+
+
+def fix_resampled_jsonl(path: Path, renames: dict[str, str], dry_run: bool) -> bool:
+    """
+    cameras/resampled_30hz.jsonl synchronise les 3 caméras par grille
+    temporelle : chaque ligne a une clé "frames"."{nom_caméra}" avec un
+    chemin "file" qui encode le nom dans "/cameras/{nom}/frame_xxx.jpg".
+
+    C'est du JSONL (1 objet par ligne), donc le correcteur JSON générique
+    (qui fait json.loads() sur tout le fichier) ne peut pas s'en charger —
+    d'où cette fonction dédiée, utilisée à la fois par SessionFixer
+    (renommages détectés sur les noms de fichiers) et par
+    detect_charuco_lr.apply_fix() (renommages head↔gripper). Sans elle, un
+    renommage laisse ce fichier pointer vers les ANCIENS noms : toute
+    corrélation caméra↔capteur basée sur ses timestamps devient
+    silencieusement fausse — une session "corrigée" en apparence mais
+    rendue inutilisable par ce fichier resté désynchronisé.
+
+    Corrige aussi au passage le typo connu "rigth" → "right" rencontré sur
+    certains rigs, qu'un renommage soit en cours ou non.
+
+    Retourne True si le fichier a été (ou aurait été, en dry-run) modifié.
+    """
+    if not path.is_file():
+        return False
+    try:
+        lines = path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return False
+
+    changed = False
+    new_lines = []
+    for line in lines:
+        if not line.strip():
+            new_lines.append(line)
+            continue
+        try:
+            d = json.loads(line)
+        except json.JSONDecodeError:
+            new_lines.append(line)
+            continue
+        frames = d.get("frames")
+        if isinstance(frames, dict):
+            new_frames = {}
+            for key, info in frames.items():
+                norm_key = "right" if key == "rigth" else key
+                new_key = renames.get(norm_key, norm_key)
+                if new_key != key:
+                    changed = True
+                if isinstance(info, dict) and isinstance(info.get("file"), str):
+                    def _sub(m):
+                        seg = "right" if m.group(2) == "rigth" else m.group(2)
+                        seg = renames.get(seg, seg)
+                        return f"{m.group(1)}{seg}{m.group(3)}"
+                    new_file = _RESAMPLED_FILE_PATH_RE.sub(_sub, info["file"])
+                    if new_file != info["file"]:
+                        info = {**info, "file": new_file}
+                        changed = True
+                new_frames[new_key] = info
+            d["frames"] = new_frames
+        new_lines.append(json.dumps(d, ensure_ascii=False))
+
+    if changed and not dry_run:
+        path.write_text("\n".join(new_lines) + "\n", encoding="utf-8")
+    return changed
 
 
 # ─── Correction d'une session ────────────────────────────────────────────────
@@ -282,6 +358,12 @@ class SessionFixer:
         except OSError:
             pass
 
+    # ── Correction dédiée de cameras/resampled_30hz.jsonl ────────────────────
+
+    def _fix_resampled_jsonl(self, path: Path, renames: dict[str, str]):
+        if fix_resampled_jsonl(path, renames, self.dry_run):
+            self._record(f"  update content {path.name}")
+
     # ── Point d'entrée ───────────────────────────────────────────────────────
 
     def fix(self) -> bool:
@@ -322,6 +404,12 @@ class SessionFixer:
                 if entry.is_file() and entry.name.endswith(".jsonl"):
                     if entry.name not in _IGNORE_FILES:
                         self._fix_jsonl_content(Path(entry.path), renames)
+
+            # 6. cameras/resampled_30hz.jsonl — exclu du scan générique ci-dessus
+            #    (c'est du JSONL, pas un nom de caméra à renommer) mais DOIT être
+            #    resynchronisé avec le même mapping, sous peine de rendre la
+            #    session inutilisable (timestamps caméra↔capteur désalignés).
+            self._fix_resampled_jsonl(cameras_dir / _RESAMPLED_FILENAME, renames)
 
         return True
 

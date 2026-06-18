@@ -46,7 +46,7 @@ except ImportError as exc:
     raise SystemExit(1)
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
-from fix_camera_names import _replace_in_json  # réutilisé pour les corrections JSON
+from fix_camera_names import _replace_in_json, fix_resampled_jsonl  # réutilisés pour les corrections
 
 _MARKER_IDS = (244, 255)
 _DEFAULT_DICT = "DICT_4X4_1000"
@@ -218,6 +218,14 @@ def apply_fix(session_dir: Path, findings: list[VideoFinding]) -> None:
         if new_obj != obj:
             path.write_text(json.dumps(new_obj, ensure_ascii=False, indent=2), encoding="utf-8")
             print(f"  update {json_name}")
+
+    # cameras/resampled_30hz.jsonl référence aussi les noms de caméra (clés
+    # "frames" + chemins "file") — JSONL, donc pas couvert par _replace_in_json
+    # ci-dessus (qui suppose un JSON simple). Sans ce correcteur dédié, ce
+    # fichier resterait désynchronisé après le swap et rendrait la session
+    # inutilisable pour toute corrélation caméra↔capteur basée sur ses timestamps.
+    if fix_resampled_jsonl(cameras_dir / "resampled_30hz.jsonl", renames, dry_run=False):
+        print("  update content resampled_30hz.jsonl")
 
 
 # ─── Main ────────────────────────────────────────────────────────────────────

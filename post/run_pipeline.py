@@ -4,11 +4,17 @@
 Chaîne, pour chaque session, les contrôles dans cet ordre :
 
   1. fix_camera_names   — corrige les typos de noms (cameras/ et sensors/)
-  2. verify_integrity   — vérifie l'existence EXACTE des fichiers attendus
+  2. verify_camera_sync — vérifie qu'un renommage éventuel (étape 1, ou un
+                           swap appliqué par detect_charuco_lr.apply_fix) a
+                           bien été propagé jusqu'à cameras/resampled_30hz.jsonl
+                           (sinon la session reste désynchronisée sur les
+                           ANCIENS noms — silencieusement inutilisable pour
+                           toute corrélation caméra↔capteur)
+  3. verify_integrity   — vérifie l'existence EXACTE des fichiers attendus
                            (+ détecte les fichiers présents mais corrompus)
-  3. diagnose_shuffle    — détecte les sessions contaminées par un autre device
+  4. diagnose_shuffle    — détecte les sessions contaminées par un autre device
                            (alignement temporel, durée jsonl + durée vidéo ffprobe)
-  4. detect_charuco_lr  — vérifie via les marqueurs ArUco 244/255 que "head"
+  5. detect_charuco_lr  — vérifie via les marqueurs ArUco 244/255 que "head"
                            ne voit jamais les pinces et que "left"/"right" les
                            voient toujours (ne tente plus de distinguer left
                            de right entre eux : signal trop bruité, voir le
@@ -64,10 +70,11 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import fix_camera_names
+import verify_camera_sync
 import verify_integrity
 import diagnose_shuffle
 
-_PIPELINE_VERSION = 3  # bump à chaque changement de sémantique pour invalider le cache existant
+_PIPELINE_VERSION = 4  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
 _DEFAULT_WORKERS = os.cpu_count() or 4
 _PROGRESS_EVERY = 200
@@ -168,6 +175,15 @@ def _process_one(
         sens_fixer.fix()
         lines.extend(f"[noms] {l.strip()}" for l in (*cam_fixer.log, *sens_fixer.log))
 
+        # Vérifie qu'un éventuel renommage left/right a bien été propagé jusqu'à
+        # cameras/resampled_30hz.jsonl — sinon la session reste synchronisée sur les
+        # ANCIENS noms et toute corrélation caméra↔capteur basée sur ses timestamps
+        # devient silencieusement fausse (cf. fix_camera_names.fix_resampled_jsonl).
+        sync_issues = verify_camera_sync.check_session(session_dir)
+        for issue in sync_issues:
+            lines.append(f"[sync]      {issue}")
+        is_sync_ok = not sync_issues
+
         integrity = verify_integrity.check_session(session_dir)
         for subdir, names in sorted(integrity.extra.items()):
             lines.append(f"[en trop]   {subdir}/  {sorted(names)}")
@@ -175,7 +191,7 @@ def _process_one(
             lines.append(f"[manquant]  {subdir}/  {sorted(names)}")
         for subdir, names in sorted(integrity.corrupt.items()):
             lines.append(f"[corrompu]  {subdir}/  {sorted(names)}")
-        is_clean = integrity.is_clean
+        is_clean = integrity.is_clean and is_sync_ok
 
         if (session_dir / "config.json").is_file():
             shuffle_report = diagnose_shuffle.analyze_session(session_dir)
