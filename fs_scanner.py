@@ -50,6 +50,8 @@ Variables d'environnement :
                           permet d'ajouter/retirer des disques physiques sans
                           modifier la config.
   DISK_SCAN_INTERVAL      Intervalle scan disques en s   (défaut: 300)
+  SERVER_GROUP            Groupe/serveur source des disques rapportés par
+                          cette instance (ex: "MADA", "XXII")  (défaut: "MADA")
   KPI_RECALC_INTERVAL     Intervalle recalcul KPI en s (mode --watch, défaut: 60)
   BACKEND_URL             URL de base de l'API backend   (défaut: http://vm-backend:5000/api)
   INTERNAL_API_TOKEN      Jeton d'authentification interne (header X-Internal-Token)
@@ -90,6 +92,11 @@ DISK_MOUNTS = os.environ.get(
 DISK_AUTODISCOVER_GLOB = os.environ.get("DISK_AUTODISCOVER_GLOB", "/mnt/*")
 DISK_SCAN_INTERVAL = int(os.environ.get("DISK_SCAN_INTERVAL", "300"))
 
+# Groupe/serveur source des disques rapportés par cette instance de
+# fs_scanner (ex: "MADA", "XXII") — permet d'afficher plusieurs racks HDD
+# distincts dans le front quand plusieurs sites/serveurs sont scannés.
+SERVER_GROUP = os.environ.get("SERVER_GROUP", "MADA")
+
 # ── Backend HTTP (remplace l'accès direct PostgreSQL) ──────────────────────────
 
 BACKEND_URL         = os.environ.get("BACKEND_URL", "http://vm-backend:5000/api")
@@ -105,23 +112,29 @@ def _backend_headers() -> dict:
 
 def _post_scan_result(folder_name: str, score: float, grade: str,
                        errors: list, warnings_count: int,
-                       size_bytes: int = 0, config: dict | None = None) -> tuple:
+                       size_bytes: int = 0, config: dict | None = None,
+                       duration_seconds: float = 0.0) -> tuple:
     """
     POST /api/pipeline/sessions/scan-result — le backend résout (ou crée
     depuis 'config') la session et écrit le score en écrasant la valeur
-    précédente. Retourne (ok, session_id, created, err).
+    précédente. duration_seconds (calculé depuis analysis.json, pour TOUTE
+    session scannée) écrase aussi sessions.duration_seconds — sans ça, cette
+    colonne ne serait alimentée que par mark-sent (sessions livrées à un
+    client), ce qui sous-estime massivement le total d'heures réel.
+    Retourne (ok, session_id, created, err).
     """
     try:
         r = requests.post(
             f"{BACKEND_URL}/pipeline/sessions/scan-result",
             json={
-                "folder_name":     folder_name,
-                "score":           score,
-                "grade":           grade,
-                "errors":          errors,
-                "warnings_count":  warnings_count,
-                "size_bytes":      size_bytes,
-                "config":          config,
+                "folder_name":      folder_name,
+                "score":            score,
+                "grade":            grade,
+                "errors":           errors,
+                "warnings_count":   warnings_count,
+                "size_bytes":       size_bytes,
+                "duration_seconds": duration_seconds,
+                "config":           config,
             },
             headers=_backend_headers(),
             timeout=15,
@@ -633,7 +646,10 @@ def _scan_disks() -> None:
         disks = _discover_disks()
         if not disks:
             return
-        payload = [{**d, "folders": _list_sessions(d["mount_path"])} for d in disks]
+        payload = [
+            {**d, "server_id": SERVER_GROUP, "folders": _list_sessions(d["mount_path"])}
+            for d in disks
+        ]
         r = requests.post(
             f"{BACKEND_URL}/storage-disks/sync",
             json={"disks": payload},
@@ -803,14 +819,15 @@ def run_once():
                     skipped += 1
                     continue
                 buffer.append({
-                    "folder_name":     folder_name,
-                    "score":           score,
-                    "grade":           grade,
-                    "errors":          errors,
-                    "warnings_count":  warnings_count,
-                    "size_bytes":      0,
-                    "config":          config,
-                    "_duration_sec":   duration_sec,
+                    "folder_name":      folder_name,
+                    "score":            score,
+                    "grade":            grade,
+                    "errors":           errors,
+                    "warnings_count":   warnings_count,
+                    "size_bytes":       0,
+                    "duration_seconds": duration_sec,
+                    "config":           config,
+                    "_duration_sec":    duration_sec,
                 })
                 if len(buffer) >= HTTP_BATCH_SIZE:
                     flush_buffer()
@@ -862,9 +879,11 @@ def _fetch_and_process(fname: str) -> tuple:
 
     size_bytes = _get_folder_size(fname)
     score, grade, errors, warnings = _evaluate_session(base, analysis, config)
+    duration_sec = _session_duration_sec(analysis)
 
     success, session_id, created, err = _post_scan_result(
         fname, score, grade, errors, len(warnings), size_bytes, config,
+        duration_seconds=duration_sec,
     )
     if not success:
         return fname, False, err
