@@ -73,6 +73,7 @@ logger = logging.getLogger(__name__)
 SESSIONS_DIR      = os.environ.get("SESSIONS_DIR",      "/data/sessions")
 SCAN_WORKERS      = int(os.environ.get("SCAN_WORKERS",  str(max(1, (cpu_count() or 4)))))
 HTTP_WORKERS      = int(os.environ.get("HTTP_WORKERS",  "8"))
+HTTP_BATCH_SIZE   = int(os.environ.get("HTTP_BATCH_SIZE", "200"))
 STABILITY_SECONDS = int(os.environ.get("STABILITY_SECONDS", "60"))
 SCAN_INTERVAL     = int(os.environ.get("SCAN_INTERVAL", "15"))
 KPI_RECALC_INTERVAL = int(os.environ.get("KPI_RECALC_INTERVAL", "60"))
@@ -131,6 +132,35 @@ def _post_scan_result(folder_name: str, score: float, grade: str,
         return False, None, False, f"HTTP {r.status_code}: {r.text}"
     except requests.RequestException as exc:
         return False, None, False, str(exc)
+
+
+def _post_scan_results_batch(items: list) -> tuple:
+    """
+    POST /api/pipeline/sessions/scan-result/batch — un seul aller-retour
+    réseau pour tout un lot (mode --once, où une requête par session serait
+    trop coûteuse sur un backlog de dizaines de milliers de sessions).
+
+    'items' : liste de dicts {folder_name, score, grade, errors,
+    warnings_count, size_bytes, config}.
+
+    Retourne (ok_global, results, err) :
+      - ok_global=False  → la requête HTTP elle-même a échoué (timeout, 5xx...)
+      - results          → dict {folder_name: {ok, session_id?, created?, error?}}
+        renvoyé par le backend, valable même si ok_global=True (chaque item
+        peut individuellement réussir ou échouer).
+    """
+    try:
+        r = requests.post(
+            f"{BACKEND_URL}/pipeline/sessions/scan-result/batch",
+            json={"results": items},
+            headers=_backend_headers(),
+            timeout=120,
+        )
+        if r.status_code == 200:
+            return True, r.json().get("results", {}), None
+        return False, {}, f"HTTP {r.status_code}: {r.text}"
+    except requests.RequestException as exc:
+        return False, {}, str(exc)
 
 
 def _load_already_scored() -> set:
@@ -725,11 +755,43 @@ def run_once():
             ThreadPoolExecutor(max_workers=HTTP_WORKERS) as http_pool:
 
         pending_http: dict = {}
+        buffer: list = []  # items prêts à être envoyés, en attente d'un lot complet
 
-        def submit_write(folder_name, score, grade, errors, warnings_count, config, duration_sec):
-            fut = http_pool.submit(_post_scan_result, folder_name, score, grade,
-                                    errors, warnings_count, 0, config)
-            pending_http[fut] = (folder_name, errors, duration_sec)
+        def flush_buffer():
+            if not buffer:
+                return
+            batch = buffer.copy()
+            buffer.clear()
+            payload = [{k: v for k, v in item.items() if k != "_duration_sec"} for item in batch]
+            fut = http_pool.submit(_post_scan_results_batch, payload)
+            pending_http[fut] = batch
+
+        def process_batch_result(fut):
+            nonlocal ok, failed, valid_count, total_duration_sec, clean_duration_sec
+            batch = pending_http.pop(fut)
+            success, results, http_err = fut.result()
+            for item in batch:
+                folder_name  = item["folder_name"]
+                duration_sec = item["_duration_sec"]
+                item_result  = results.get(folder_name) if success else None
+                if not item_result or not item_result.get("ok"):
+                    logger.warning("%s : échec backend — %s", folder_name,
+                                    http_err or (item_result or {}).get("error", "?"))
+                    failed += 1
+                    continue
+                ok += 1
+                total_duration_sec += duration_sec or 0
+                if not item["errors"]:
+                    valid_count += 1
+                    clean_duration_sec += duration_sec or 0
+            if (ok + failed) % 500 == 0:
+                logger.info("  ... %d traités (%.1f/s)",
+                            ok + failed,
+                            (ok + failed) / max(1, time.monotonic() - t_scan))
+
+        def drain_completed():
+            for fut in [f for f in pending_http if f.done()]:
+                process_batch_result(fut)
 
         for chunk_results in pool.map(_scan_chunk, chunks, chunksize=1):
             for folder_name, score, grade, errors, warnings_count, config, duration_sec, err in chunk_results:
@@ -740,41 +802,26 @@ def run_once():
                     logger.debug("%s : erreur lecture — %s", folder_name, err)
                     skipped += 1
                     continue
-                submit_write(folder_name, score, grade, errors, warnings_count, config, duration_sec)
+                buffer.append({
+                    "folder_name":     folder_name,
+                    "score":           score,
+                    "grade":           grade,
+                    "errors":          errors,
+                    "warnings_count":  warnings_count,
+                    "size_bytes":      0,
+                    "config":          config,
+                    "_duration_sec":   duration_sec,
+                })
+                if len(buffer) >= HTTP_BATCH_SIZE:
+                    flush_buffer()
 
-            # Vide la fenêtre d'écritures HTTP terminées pour ne pas accumuler
-            # des milliers de futures en mémoire sur un gros backlog.
-            done = [f for f in pending_http if f.done()]
-            for fut in done:
-                folder_name, errors, duration_sec = pending_http.pop(fut)
-                success, session_id, created, http_err = fut.result()
-                if not success:
-                    logger.warning("%s : échec backend — %s", folder_name, http_err)
-                    failed += 1
-                    continue
-                ok += 1
-                total_duration_sec += duration_sec or 0
-                if not errors:
-                    valid_count += 1
-                    clean_duration_sec += duration_sec or 0
-                if (ok + failed) % 500 == 0:
-                    logger.info("  ... %d traités (%.1f/s)",
-                                ok + failed,
-                                (ok + failed) / max(1, time.monotonic() - t_scan))
+            # Vide la fenêtre de lots HTTP terminés pour ne pas accumuler des
+            # centaines de futures en mémoire sur un gros backlog.
+            drain_completed()
 
-        # Attend les écritures HTTP encore en vol
+        flush_buffer()
         for fut in as_completed(list(pending_http.keys())):
-            folder_name, errors, duration_sec = pending_http.pop(fut)
-            success, session_id, created, http_err = fut.result()
-            if not success:
-                logger.warning("%s : échec backend — %s", folder_name, http_err)
-                failed += 1
-                continue
-            ok += 1
-            total_duration_sec += duration_sec or 0
-            if not errors:
-                valid_count += 1
-                clean_duration_sec += duration_sec or 0
+            process_batch_result(fut)
 
     t_db = time.monotonic()
     logger.info("Scan FS terminé en %.1fs | %d traités %d échecs backend "
