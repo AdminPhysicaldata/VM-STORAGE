@@ -1,7 +1,9 @@
 #!/usr/bin/env python3
 """
 fs_scanner.py — Scanne /data/sessions directement sur vm-storage (pas de SFTP),
-lie les sessions à la BDD, les note via analysis.json et met à jour les KPIs.
+lie les sessions à la BDD via le backend HTTP (vm-backend), et met à jour les
+KPIs. Aucun accès direct à PostgreSQL : tout passe par BACKEND_URL (comme
+sessions-uploader/SessionsToMistral.py).
 
 Vérification d'intégrité (_check_files_integrity) :
   Pour chaque caméra/capteur déclaré dans config.json, vérifie la présence
@@ -11,29 +13,31 @@ Vérification d'intégrité (_check_files_integrity) :
     - cameras/resample_report.json + resampled_30hz.jsonl (si caméras déclarées)
     - sensors/<name>.jsonl doit exister, taille > 0, première/dernière ligne JSON valides
   Toute session avec un fichier manquant ou corrompu est notée F / score 0,
-  et le détail est ajouté à la liste d'erreurs stockée en BDD.
+  et le détail est ajouté à la liste d'erreurs envoyée au backend.
 
 Modes :
-  --once   Scan complet ultra-rapide (multiprocessing + batch DB) puis quitte.
-           Idéal pour rattraper un backlog de dizaines de milliers de sessions.
+  --once   Scan complet ultra-rapide (multiprocessing + écritures HTTP en
+           parallèle) puis quitte. Idéal pour rattraper un backlog.
   --watch  Surveillance continue avec polling du FS (défaut).
 
 Architecture --once :
-  1. os.scandir() → liste des dossiers non encore traités
-  2. Chargement du session_map complet depuis la BDD (1 seule SELECT)
-  3. ProcessPoolExecutor (SCAN_WORKERS processus) → chaque processus traite
+  1. os.scandir() → liste des dossiers
+  2. ProcessPoolExecutor (SCAN_WORKERS processus) → chaque processus traite
      un chunk de sessions, et utilise lui-même un ThreadPoolExecutor
      (SCAN_THREADS_PER_WORKER threads) pour paralléliser l'I/O par session
-     (lecture JSON, parcours des atomes mp4, lecture jsonl)
-  4. Écriture DB en batch (une seule connexion, commit toutes les DB_BATCH sessions)
-  5. Recalcul KPIs en une seule requête SQL d'agrégation
-  6. Bilan final : sessions scannées, heures propres, % valides / invalides
+     (lecture JSON, parcours des atomes mp4, lecture jsonl) — tout en local,
+     aucun accès réseau dans cette étape
+  3. ThreadPoolExecutor (HTTP_WORKERS threads) → POST du résultat de chaque
+     session vers /api/pipeline/sessions/scan-result (le backend résout ou
+     crée la session et écrit le score)
+  4. Recalcul KPIs via /api/pipeline/kpis/recalculate
+  5. Bilan final : sessions scannées, heures propres, % valides / invalides
 
 Variables d'environnement :
   SESSIONS_DIR            Répertoire sessions           (défaut: /data/sessions)
-  SCAN_WORKERS            Processus parallèles          (défaut: nb CPUs)
+  SCAN_WORKERS            Processus parallèles (scan)   (défaut: nb CPUs)
   SCAN_THREADS_PER_WORKER Threads I/O par processus      (défaut: 4)
-  DB_BATCH                Sessions par commit DB         (défaut: 500)
+  HTTP_WORKERS            Threads d'écriture backend     (défaut: 8)
   STABILITY_SECONDS       Stabilité avant traitement     (défaut: 60)
   SCAN_INTERVAL           Intervalle watch en s          (défaut: 15)
   DISK_MOUNTS             Disques SSD/HDD à suivre explicitement, format
@@ -46,21 +50,21 @@ Variables d'environnement :
                           permet d'ajouter/retirer des disques physiques sans
                           modifier la config.
   DISK_SCAN_INTERVAL      Intervalle scan disques en s   (défaut: 300)
-  POSTGRES_HOST/PORT/DB/USER/PASSWORD
+  KPI_RECALC_INTERVAL     Intervalle recalcul KPI en s (mode --watch, défaut: 60)
+  BACKEND_URL             URL de base de l'API backend   (défaut: http://vm-backend:5000/api)
+  INTERNAL_API_TOKEN      Jeton d'authentification interne (header X-Internal-Token)
 """
 
 import glob
 import json
 import logging
 import os
-import re
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
-from datetime import datetime, timezone
 from multiprocessing import cpu_count
 from pathlib import Path
 
-import psycopg2
+import requests
 
 logger = logging.getLogger(__name__)
 
@@ -68,9 +72,10 @@ logger = logging.getLogger(__name__)
 
 SESSIONS_DIR      = os.environ.get("SESSIONS_DIR",      "/data/sessions")
 SCAN_WORKERS      = int(os.environ.get("SCAN_WORKERS",  str(max(1, (cpu_count() or 4)))))
-DB_BATCH          = int(os.environ.get("DB_BATCH",      "500"))
+HTTP_WORKERS      = int(os.environ.get("HTTP_WORKERS",  "8"))
 STABILITY_SECONDS = int(os.environ.get("STABILITY_SECONDS", "60"))
 SCAN_INTERVAL     = int(os.environ.get("SCAN_INTERVAL", "15"))
+KPI_RECALC_INTERVAL = int(os.environ.get("KPI_RECALC_INTERVAL", "60"))
 
 # Disques de stockage (SSD à expédier / HDD de sauvegarde) — voir _scan_disks().
 # Format : "mount_path:type:label:disk_uuid" (type = ssd|hdd), séparés par ';'.
@@ -84,44 +89,80 @@ DISK_MOUNTS = os.environ.get(
 DISK_AUTODISCOVER_GLOB = os.environ.get("DISK_AUTODISCOVER_GLOB", "/mnt/*")
 DISK_SCAN_INTERVAL = int(os.environ.get("DISK_SCAN_INTERVAL", "300"))
 
+# ── Backend HTTP (remplace l'accès direct PostgreSQL) ──────────────────────────
 
-# ── Connexion PostgreSQL ───────────────────────────────────────────────────────
-
-def _pg_connect():
-    return psycopg2.connect(
-        host=os.environ.get("POSTGRES_HOST",     "192.168.1.18"),
-        port=int(os.environ.get("POSTGRES_PORT", "5432")),
-        dbname=os.environ.get("POSTGRES_DB",     "robotics"),
-        user=os.environ.get("POSTGRES_USER",     "robotics"),
-        password=os.environ.get("POSTGRES_PASSWORD", "YsLuB46NKoF6WlS3NwUm97vhEtLkjLRQ"),
-        connect_timeout=10,
-    )
+BACKEND_URL         = os.environ.get("BACKEND_URL", "http://vm-backend:5000/api")
+INTERNAL_API_TOKEN  = os.environ.get("INTERNAL_API_TOKEN", "")
 
 
-def _ensure_kpi_table(conn) -> None:
-    with conn.cursor() as cur:
-        cur.execute("""
-            CREATE TABLE IF NOT EXISTS kpi_quality_snapshots (
-                project_id      TEXT        NOT NULL,
-                site_id         TEXT        NOT NULL DEFAULT 'default',
-                snapshot_date   DATE        NOT NULL,
-                session_count   INTEGER     NOT NULL DEFAULT 0,
-                scored_count    INTEGER     NOT NULL DEFAULT 0,
-                avg_score       FLOAT,
-                min_score       FLOAT,
-                max_score       FLOAT,
-                grade_a_count   INTEGER     NOT NULL DEFAULT 0,
-                grade_b_count   INTEGER     NOT NULL DEFAULT 0,
-                grade_c_count   INTEGER     NOT NULL DEFAULT 0,
-                grade_d_count   INTEGER     NOT NULL DEFAULT 0,
-                grade_f_count   INTEGER     NOT NULL DEFAULT 0,
-                errors_count    INTEGER     NOT NULL DEFAULT 0,
-                warnings_count  INTEGER     NOT NULL DEFAULT 0,
-                updated_at      TIMESTAMPTZ NOT NULL DEFAULT now(),
-                PRIMARY KEY (project_id, site_id, snapshot_date)
-            )
-        """)
-    conn.commit()
+def _backend_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if INTERNAL_API_TOKEN:
+        headers["X-Internal-Token"] = INTERNAL_API_TOKEN
+    return headers
+
+
+def _post_scan_result(folder_name: str, score: float, grade: str,
+                       errors: list, warnings_count: int,
+                       size_bytes: int = 0, config: dict | None = None) -> tuple:
+    """
+    POST /api/pipeline/sessions/scan-result — le backend résout (ou crée
+    depuis 'config') la session et écrit le score en écrasant la valeur
+    précédente. Retourne (ok, session_id, created, err).
+    """
+    try:
+        r = requests.post(
+            f"{BACKEND_URL}/pipeline/sessions/scan-result",
+            json={
+                "folder_name":     folder_name,
+                "score":           score,
+                "grade":           grade,
+                "errors":          errors,
+                "warnings_count":  warnings_count,
+                "size_bytes":      size_bytes,
+                "config":          config,
+            },
+            headers=_backend_headers(),
+            timeout=15,
+        )
+        if r.status_code == 200:
+            data = r.json()
+            return True, data.get("session_id"), bool(data.get("created")), None
+        return False, None, False, f"HTTP {r.status_code}: {r.text}"
+    except requests.RequestException as exc:
+        return False, None, False, str(exc)
+
+
+def _load_already_scored() -> set:
+    """Dossiers déjà scorés, via le backend (mode --watch)."""
+    try:
+        r = requests.get(
+            f"{BACKEND_URL}/pipeline/sessions/scanned-folders",
+            headers=_backend_headers(), timeout=30,
+        )
+        if r.status_code == 200:
+            return set(r.json().get("folders") or [])
+        logger.warning("Impossible de charger les sessions déjà scorées [%s]: %s",
+                        r.status_code, r.text)
+    except requests.RequestException as exc:
+        logger.warning("Impossible de charger les sessions déjà scorées : %s", exc)
+    return set()
+
+
+def _recalculate_kpis() -> None:
+    """Déclenche le recalcul KPI côté backend (une seule requête d'agrégation)."""
+    logger.info("Recalcul KPI en cours...")
+    try:
+        r = requests.post(
+            f"{BACKEND_URL}/pipeline/kpis/recalculate",
+            headers=_backend_headers(), timeout=60,
+        )
+        if r.status_code == 200:
+            logger.info("Recalcul KPI terminé.")
+        else:
+            logger.warning("Recalcul KPI échoué [%s]: %s", r.status_code, r.text)
+    except requests.RequestException as exc:
+        logger.warning("Recalcul KPI : erreur réseau — %s", exc)
 
 
 # ── Score depuis analysis.json ─────────────────────────────────────────────────
@@ -476,258 +517,10 @@ def _get_folder_size(folder_name: str) -> int:
     return total
 
 
-# ── Résolution session_id ──────────────────────────────────────────────────────
-
-def _folder_to_timestamp(folder_name: str) -> str | None:
-    m = re.match(r"^session_(\d{8})_(\d{6})", folder_name)
-    if m:
-        return f"{m.group(1)}_{m.group(2)}"
-    m = re.match(r"^(\d{4})-(\d{2})-(\d{2})_(\d{2})-(\d{2})-(\d{2})", folder_name)
-    if m:
-        return f"{m.group(1)}{m.group(2)}{m.group(3)}_{m.group(4)}{m.group(5)}{m.group(6)}"
-    return None
-
-
-def _resolve_from_map(session_map: dict, folder_name: str, analysis: dict | None) -> str | None:
-    """
-    Résout session_id depuis le dictionnaire pré-chargé (pas de SELECT).
-    Stratégies identiques à _resolve_session_id.
-    """
-    if folder_name in session_map:
-        return session_map[folder_name]
-
-    ts = _folder_to_timestamp(folder_name)
-    if ts:
-        prefix = f"sess_{ts}"
-        for key, sid in session_map.items():
-            if key.startswith(prefix):
-                return sid
-
-    if analysis:
-        robot_path = analysis.get("session", "")
-        if robot_path:
-            basename = robot_path.split("/")[-1]
-            for candidate in (robot_path, f"./data/{basename}", f"/data/{basename}", basename):
-                if candidate in session_map:
-                    return session_map[candidate]
-
-    return None
-
-
-def _resolve_session_id(cur, folder_name: str, analysis: dict | None = None) -> str | None:
-    """Résolution par SELECT DB — utilisé en mode --watch uniquement."""
-    for query, params in [
-        ("SELECT session_id FROM sessions WHERE session_folder = %s LIMIT 1", (folder_name,)),
-        ("SELECT session_id FROM sessions WHERE session_id     = %s LIMIT 1", (folder_name,)),
-    ]:
-        cur.execute(query, params)
-        row = cur.fetchone()
-        if row:
-            return row[0]
-
-    ts = _folder_to_timestamp(folder_name)
-    if ts:
-        cur.execute(
-            "SELECT session_id FROM sessions WHERE session_id LIKE %s LIMIT 1",
-            (f"sess_{ts}%",),
-        )
-        row = cur.fetchone()
-        if row:
-            return row[0]
-
-    if analysis:
-        robot_path = analysis.get("session", "")
-        if robot_path:
-            basename = robot_path.split("/")[-1]
-            for candidate in (robot_path, f"./data/{basename}", f"/data/{basename}", basename):
-                cur.execute(
-                    "SELECT session_id FROM sessions WHERE session_folder = %s LIMIT 1",
-                    (candidate,),
-                )
-                row = cur.fetchone()
-                if row:
-                    return row[0]
-
-    return None
-
-
-def _create_session_from_config(cur, folder_name: str, config: dict) -> str:
-    ts = _folder_to_timestamp(folder_name)
-    session_id = f"sess_{ts}_fs" if ts else f"sess_{folder_name}"
-
-    operator = config.get("operator") or {}
-    rig      = config.get("rig")      or {}
-    project  = config.get("project")  or {}
-
-    started_at = None
-    if ts:
-        try:
-            started_at = datetime.strptime(ts, "%Y%m%d_%H%M%S").replace(tzinfo=timezone.utc)
-        except ValueError:
-            pass
-
-    cur.execute("""
-        INSERT INTO sessions (
-            session_id, operator_id, operator_name, site_id, project_id,
-            rig_id, pipeline_status, session_folder, started_at, created_at
-        ) VALUES (%s, %s, %s, %s, %s, %s, 'captured', %s, %s, now())
-        ON CONFLICT (session_id) DO NOTHING
-    """, (
-        session_id,
-        operator.get("operator_id"),
-        operator.get("full_name"),
-        rig.get("site_id", "default"),
-        project.get("project_id"),
-        rig.get("rig_id"),
-        folder_name,
-        started_at,
-    ))
-    return session_id
-
-
-# ── Chargement DB ──────────────────────────────────────────────────────────────
-
-def _load_already_scored() -> set:
-    """Dossiers déjà scorés depuis la BDD."""
-    try:
-        conn = _pg_connect()
-        with conn:
-            with conn.cursor() as cur:
-                cur.execute("""
-                    SELECT session_folder
-                    FROM sessions
-                    WHERE session_folder ~ '^session_\\d{8}_\\d{6}'
-                      AND quality_score IS NOT NULL
-                    UNION
-                    SELECT COALESCE(session_folder, session_id)
-                    FROM sessions
-                    WHERE metadata ? 'capture_quality'
-                """)
-                result = {row[0] for row in cur.fetchall() if row[0]}
-        conn.close()
-        return result
-    except Exception as exc:
-        logger.warning("Impossible de charger les sessions déjà scorées : %s", exc)
-        return set()
-
-
-def _load_session_map(conn) -> dict:
-    """
-    Charge TOUS les mappings folder→session_id en une seule requête.
-    Évite 40k SELECT individuels dans _resolve_session_id.
-    """
-    with conn.cursor() as cur:
-        cur.execute("""
-            SELECT COALESCE(session_folder, session_id), session_id
-            FROM sessions
-            WHERE session_folder IS NOT NULL OR session_id IS NOT NULL
-        """)
-        return {row[0]: row[1] for row in cur.fetchall() if row[0]}
-
-
-# ── Écriture DB (session + KPI) ────────────────────────────────────────────────
-
-def _write_session(cur, folder_name: str, session_id: str,
-                   score: float, grade: str,
-                   errors: list, warnings_count: int,
-                   size_bytes: int = 0) -> bool:
-    """UPDATE sessions + UPSERT KPI pour une session. Pas de commit (fait par l'appelant)."""
-    capture_meta = json.dumps({
-        "score":          score,
-        "grade":          grade,
-        "errors":         errors,
-        "warnings_count": warnings_count,
-        "size_bytes":     size_bytes,
-        "scored_at":      datetime.now(timezone.utc).isoformat(),
-        "source":         "fs_scanner",
-    }, ensure_ascii=False)
-
-    cur.execute("""
-        UPDATE sessions
-        SET session_folder  = %s,
-            size_bytes      = CASE WHEN %s > 0 THEN %s ELSE size_bytes END,
-            quality_score   = %s,
-            quality_grade   = %s,
-            pipeline_status = CASE
-                WHEN pipeline_status IN ('queued', 'captured') THEN 'captured'
-                ELSE pipeline_status
-            END,
-            metadata = metadata || jsonb_build_object('capture_quality', %s::jsonb)
-        WHERE session_id = %s
-    """, (folder_name, size_bytes, size_bytes, score, grade, capture_meta, session_id))
-
-    return cur.rowcount > 0
-
-
-def _recalculate_kpis(conn) -> None:
-    """
-    Recalcule TOUS les KPI depuis la table sessions en une seule requête.
-    Remplace les N UPSERT incrémentaux — résultat correct garanti.
-    """
-    logger.info("Recalcul KPI en cours...")
-    with conn.cursor() as cur:
-        cur.execute("""
-            INSERT INTO kpi_quality_snapshots (
-                project_id, site_id, snapshot_date,
-                session_count, scored_count,
-                avg_score, min_score, max_score,
-                grade_a_count, grade_b_count, grade_c_count,
-                grade_d_count, grade_f_count,
-                errors_count, warnings_count, updated_at
-            )
-            SELECT
-                COALESCE(project_id,  'unknown'),
-                COALESCE(site_id,     'default'),
-                COALESCE(started_at::date, CURRENT_DATE),
-                COUNT(*),
-                COUNT(quality_score),
-                ROUND(AVG(quality_score)::numeric, 1),
-                MIN(quality_score),
-                MAX(quality_score),
-                COUNT(*) FILTER (WHERE quality_grade = 'A'),
-                COUNT(*) FILTER (WHERE quality_grade = 'B'),
-                COUNT(*) FILTER (WHERE quality_grade = 'C'),
-                COUNT(*) FILTER (WHERE quality_grade = 'D'),
-                COUNT(*) FILTER (WHERE quality_grade = 'F'),
-                COALESCE(SUM(
-                    jsonb_array_length(
-                        COALESCE(metadata->'capture_quality'->'errors', '[]'::jsonb)
-                    )
-                ), 0),
-                COALESCE(SUM(
-                    (metadata->'capture_quality'->>'warnings_count')::int
-                ), 0),
-                now()
-            FROM sessions
-            WHERE quality_score IS NOT NULL
-            GROUP BY
-                COALESCE(project_id,  'unknown'),
-                COALESCE(site_id,     'default'),
-                COALESCE(started_at::date, CURRENT_DATE)
-            ON CONFLICT (project_id, site_id, snapshot_date) DO UPDATE SET
-                session_count  = EXCLUDED.session_count,
-                scored_count   = EXCLUDED.scored_count,
-                avg_score      = EXCLUDED.avg_score,
-                min_score      = EXCLUDED.min_score,
-                max_score      = EXCLUDED.max_score,
-                grade_a_count  = EXCLUDED.grade_a_count,
-                grade_b_count  = EXCLUDED.grade_b_count,
-                grade_c_count  = EXCLUDED.grade_c_count,
-                grade_d_count  = EXCLUDED.grade_d_count,
-                grade_f_count  = EXCLUDED.grade_f_count,
-                errors_count   = EXCLUDED.errors_count,
-                warnings_count = EXCLUDED.warnings_count,
-                updated_at     = now()
-        """)
-    conn.commit()
-    logger.info("Recalcul KPI terminé.")
-
-
 # ── Disques de stockage (SSD/HDD) ───────────────────────────────────────────────
-# Répartit les sessions par disque physique (storage_disks, table créée par
-# la migration 008). Code additif : n'interfère jamais avec le scoring /
-# les KPI ci-dessus, et n'interrompt jamais la boucle principale en cas
-# d'erreur (ex : migration pas encore appliquée, disque pas encore monté).
+# Répartit les sessions par disque physique (storage_disks). Code additif :
+# n'interfère jamais avec le scoring / les KPI ci-dessus, et n'interrompt
+# jamais la boucle principale en cas d'erreur (ex : disque pas encore monté).
 
 def _parse_disk_mounts() -> list:
     """Parse DISK_MOUNTS = 'mount_path:type:label:disk_uuid;...'."""
@@ -803,124 +596,51 @@ def _discover_disks() -> list:
     return disks
 
 
-def _upsert_disks(conn, disks: list) -> None:
-    with conn.cursor() as cur:
-        for d in disks:
-            cur.execute("""
-                INSERT INTO storage_disks (
-                    disk_uuid, server_id, disk_type, label, mount_path,
-                    total_bytes, used_bytes, free_bytes, last_scanned_at, updated_at
-                ) VALUES (%s, 'vm-storage', %s, %s, %s, %s, %s, %s, now(), now())
-                ON CONFLICT (disk_uuid) DO UPDATE SET
-                    disk_type       = EXCLUDED.disk_type,
-                    label           = COALESCE(storage_disks.label, EXCLUDED.label),
-                    mount_path      = EXCLUDED.mount_path,
-                    total_bytes     = EXCLUDED.total_bytes,
-                    used_bytes      = EXCLUDED.used_bytes,
-                    free_bytes      = EXCLUDED.free_bytes,
-                    last_scanned_at = now(),
-                    updated_at      = now()
-            """, (
-                d["disk_uuid"], d["disk_type"], d["label"], d["mount_path"],
-                d["total_bytes"], d["used_bytes"], d["free_bytes"],
-            ))
-    conn.commit()
-
-
-def _assign_sessions_to_disk(conn, disk: dict) -> None:
-    """Met à jour ssd_disk_uuid / hdd_disk_uuid : assigne ce disque aux sessions
-    dont le dossier est présent dans son mount_path, et désassigne les sessions
-    qui y pointaient mais dont le dossier a disparu (ex : SSD vidé après envoi)."""
-    folders = _list_sessions(disk["mount_path"])
-    col = "ssd_disk_uuid" if disk["disk_type"] == "ssd" else "hdd_disk_uuid"
-    with conn.cursor() as cur:
-        if folders:
-            cur.execute(f"""
-                UPDATE sessions SET {col} = %s
-                WHERE session_folder = ANY(%s) AND {col} IS DISTINCT FROM %s
-            """, (disk["disk_uuid"], folders, disk["disk_uuid"]))
-        cur.execute(f"""
-            UPDATE sessions SET {col} = NULL
-            WHERE {col} = %s
-              AND session_folder IS NOT NULL
-              AND NOT (session_folder = ANY(%s))
-        """, (disk["disk_uuid"], folders))
-    conn.commit()
-
-
-def _recalculate_disk_stats(conn) -> None:
-    """Recalcule session_count / sessions_delivered_count pour chaque disque
-    (une session est "livrée" si pipeline_status='delivered' OU si elle a une
-    ligne client_deliveries au statut 'delivered')."""
-    with conn.cursor() as cur:
-        cur.execute("""
-            UPDATE storage_disks sd SET
-                session_count = (
-                    SELECT COUNT(*) FROM sessions s
-                    WHERE s.ssd_disk_uuid = sd.disk_uuid OR s.hdd_disk_uuid = sd.disk_uuid
-                ),
-                sessions_delivered_count = (
-                    SELECT COUNT(*) FROM sessions s
-                    WHERE (s.ssd_disk_uuid = sd.disk_uuid OR s.hdd_disk_uuid = sd.disk_uuid)
-                      AND (
-                          s.pipeline_status = 'delivered'
-                          OR EXISTS (
-                              SELECT 1 FROM client_deliveries cd
-                              WHERE cd.session_id = s.session_id AND cd.status = 'delivered'
-                          )
-                      )
-                ),
-                updated_at = now()
-        """)
-    conn.commit()
-
-
-def _scan_disks(conn) -> None:
-    """Point d'entrée disques : découverte + assignation + agrégats.
-    Ne lève jamais (table éventuellement absente si migration 008 pas
-    encore appliquée, disques pas encore montés, etc.)."""
+def _scan_disks() -> None:
+    """Point d'entrée disques : découverte locale (FS) + synchronisation via
+    le backend (POST /api/storage-disks/sync). Ne lève jamais."""
     try:
         disks = _discover_disks()
         if not disks:
             return
-        _upsert_disks(conn, disks)
-        for disk in disks:
-            _assign_sessions_to_disk(conn, disk)
-        _recalculate_disk_stats(conn)
-        logger.info("Disques : %d disque(s) scanné(s)", len(disks))
+        payload = [{**d, "folders": _list_sessions(d["mount_path"])} for d in disks]
+        r = requests.post(
+            f"{BACKEND_URL}/storage-disks/sync",
+            json={"disks": payload},
+            headers=_backend_headers(),
+            timeout=60,
+        )
+        if r.status_code == 200:
+            logger.info("Disques : %d disque(s) synchronisé(s)", len(disks))
+        else:
+            logger.warning("Sync disques échouée [%s]: %s", r.status_code, r.text)
+    except requests.RequestException as exc:
+        logger.warning("Sync disques : erreur réseau — %s", exc)
     except Exception:
-        conn.rollback()
-        logger.exception("Erreur lors du scan des disques (migration 008 appliquée ?)")
+        logger.exception("Erreur lors du scan des disques")
 
 
 # ── Bilan final ───────────────────────────────────────────────────────────────
 
-def _print_summary(conn, total_on_disk: int, valid_count: int,
+def _print_summary(total_on_disk: int, valid_count: int,
                     total_duration_sec: float, clean_duration_sec: float,
                     elapsed: float) -> None:
     """Affiche la distribution des notes, le total sessions, le total
     d'heures et le détail heures propres / % sessions valides-invalides."""
+    scored = a = b = c = d = f = 0
+    avg = None
     try:
-        with conn.cursor() as cur:
-            cur.execute("""
-                SELECT
-                    COUNT(*)                                          AS scored,
-                    COUNT(*) FILTER (WHERE quality_grade = 'A')      AS a,
-                    COUNT(*) FILTER (WHERE quality_grade = 'B')      AS b,
-                    COUNT(*) FILTER (WHERE quality_grade = 'C')      AS c,
-                    COUNT(*) FILTER (WHERE quality_grade = 'D')      AS d,
-                    COUNT(*) FILTER (WHERE quality_grade = 'F')      AS f,
-                    ROUND(AVG(quality_score)::numeric, 1)            AS avg
-                FROM sessions
-                WHERE quality_score IS NOT NULL
-            """)
-            row = cur.fetchone()
-    except Exception as exc:
+        r = requests.get(f"{BACKEND_URL}/quality-kpis", headers=_backend_headers(), timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            grades = {g["grade"]: g["count"] for g in data.get("grade_distribution", [])}
+            a, b, c, d, f = (grades.get(k, 0) for k in ("A", "B", "C", "D", "F"))
+            scored = data.get("global", {}).get("scored_count") or 0
+            avg    = data.get("global", {}).get("avg_score")
+        else:
+            logger.warning("Impossible de récupérer les stats [%s]: %s", r.status_code, r.text)
+    except requests.RequestException as exc:
         logger.warning("Impossible de récupérer les stats : %s", exc)
-        return
-
-    scored, a, b, c, d, f, avg = row
-    scored = scored or 0
 
     def pct(n):
         return f"{n / scored * 100:.1f}%" if scored else "—"
@@ -967,14 +687,13 @@ def _print_summary(conn, total_on_disk: int, valid_count: int,
 def run_once():
     """
     Scan complet ultra-rapide :
-      1. Liste tous les dossiers → filtre déjà traités
-      2. Charge session_map depuis DB (1 SELECT)
-      3. ProcessPoolExecutor : lecture JSON + scoring en parallèle
-      4. Batch DB writes (DB_BATCH par commit)
-      5. Recalcul KPI final en 1 requête SQL
+      1. Liste tous les dossiers (tout retraiter, sans filtrage)
+      2. ProcessPoolExecutor : lecture JSON + scoring en parallèle (local)
+      3. ThreadPoolExecutor : POST de chaque résultat vers le backend
+      4. Recalcul KPI final via le backend
     """
-    logger.info("=== fs_scanner --once | workers=%d batch=%d dir=%s ===",
-                SCAN_WORKERS, DB_BATCH, SESSIONS_DIR)
+    logger.info("=== fs_scanner --once | workers=%d http_workers=%d dir=%s backend=%s ===",
+                SCAN_WORKERS, HTTP_WORKERS, SESSIONS_DIR, BACKEND_URL)
 
     t0 = time.monotonic()
 
@@ -987,13 +706,7 @@ def run_once():
         logger.info("Rien à faire.")
         return
 
-    # ── Étape 2 : connexion DB + session_map ───────────────────────────────────
-    conn = _pg_connect()
-    _ensure_kpi_table(conn)
-    session_map = _load_session_map(conn)
-    logger.info("session_map chargé : %d entrées", len(session_map))
-
-    # ── Étape 3 : scan parallèle par chunks ────────────────────────────────────
+    # ── Étape 2 : scan parallèle par chunks (local, sans réseau) ───────────────
     chunk_size = max(1, len(to_scan) // (SCAN_WORKERS * 4))
     chunks = [
         (SESSIONS_DIR, to_scan[i:i + chunk_size])
@@ -1005,15 +718,21 @@ def run_once():
     valid_count = 0
     total_duration_sec = 0.0
     clean_duration_sec = 0.0
-    pending_new_sessions: list = []  # créées en cours de scan, ajoutées au map
 
     t_scan = time.monotonic()
 
-    with ProcessPoolExecutor(max_workers=SCAN_WORKERS) as pool:
-        for chunk_results in pool.map(_scan_chunk, chunks, chunksize=1):
-            # ── Écriture DB pour ce chunk ───────────────────────────────────────
-            for folder_name, score, grade, errors, warnings_count, config, duration_sec, err in chunk_results:
+    with ProcessPoolExecutor(max_workers=SCAN_WORKERS) as pool, \
+            ThreadPoolExecutor(max_workers=HTTP_WORKERS) as http_pool:
 
+        pending_http: dict = {}
+
+        def submit_write(folder_name, score, grade, errors, warnings_count, config, duration_sec):
+            fut = http_pool.submit(_post_scan_result, folder_name, score, grade,
+                                    errors, warnings_count, 0, config)
+            pending_http[fut] = (folder_name, errors, duration_sec)
+
+        for chunk_results in pool.map(_scan_chunk, chunks, chunksize=1):
+            for folder_name, score, grade, errors, warnings_count, config, duration_sec, err in chunk_results:
                 if err == "no_analysis":
                     no_analysis += 1
                     continue
@@ -1021,71 +740,91 @@ def run_once():
                     logger.debug("%s : erreur lecture — %s", folder_name, err)
                     skipped += 1
                     continue
+                submit_write(folder_name, score, grade, errors, warnings_count, config, duration_sec)
 
-                try:
-                    with conn.cursor() as cur:
-                        # Résolution depuis le map pré-chargé (pas de SELECT)
-                        session_id = _resolve_from_map(session_map, folder_name, None)
-
-                        if not session_id:
-                            if config:
-                                session_id = _create_session_from_config(cur, folder_name, config)
-                                session_map[folder_name] = session_id  # mise à jour locale
-                                logger.info("Nouvelle session créée : %s → %s",
-                                            folder_name, session_id)
-                            else:
-                                logger.debug("'%s' introuvable en BDD (pas de config.json)",
-                                             folder_name)
-                                failed += 1
-                                continue
-
-                        updated = _write_session(
-                            cur, folder_name, session_id,
-                            score, grade, errors, warnings_count,
-                        )
-
-                    if updated:
-                        ok += 1
-                        total_duration_sec += duration_sec or 0
-                        if not errors:
-                            valid_count += 1
-                            clean_duration_sec += duration_sec or 0
-                    else:
-                        failed += 1
-
-                except Exception as exc:
-                    conn.rollback()
-                    logger.warning("%s : erreur DB — %s", folder_name, exc)
-                    skipped += 1
+            # Vide la fenêtre d'écritures HTTP terminées pour ne pas accumuler
+            # des milliers de futures en mémoire sur un gros backlog.
+            done = [f for f in pending_http if f.done()]
+            for fut in done:
+                folder_name, errors, duration_sec = pending_http.pop(fut)
+                success, session_id, created, http_err = fut.result()
+                if not success:
+                    logger.warning("%s : échec backend — %s", folder_name, http_err)
+                    failed += 1
                     continue
-
-                # Commit par lot
-                if (ok + failed) % DB_BATCH == 0:
-                    conn.commit()
+                ok += 1
+                total_duration_sec += duration_sec or 0
+                if not errors:
+                    valid_count += 1
+                    clean_duration_sec += duration_sec or 0
+                if (ok + failed) % 500 == 0:
                     logger.info("  ... %d traités (%.1f/s)",
                                 ok + failed,
                                 (ok + failed) / max(1, time.monotonic() - t_scan))
 
-    conn.commit()
+        # Attend les écritures HTTP encore en vol
+        for fut in as_completed(list(pending_http.keys())):
+            folder_name, errors, duration_sec = pending_http.pop(fut)
+            success, session_id, created, http_err = fut.result()
+            if not success:
+                logger.warning("%s : échec backend — %s", folder_name, http_err)
+                failed += 1
+                continue
+            ok += 1
+            total_duration_sec += duration_sec or 0
+            if not errors:
+                valid_count += 1
+                clean_duration_sec += duration_sec or 0
 
     t_db = time.monotonic()
-    logger.info("Scan FS terminé en %.1fs | %d traités %d sans session_id "
-                "%d sans analysis.json %d erreurs",
+    logger.info("Scan FS terminé en %.1fs | %d traités %d échecs backend "
+                "%d sans analysis.json %d erreurs lecture",
                 t_db - t_scan, ok, failed, no_analysis, skipped)
 
-    # ── Étape 5 : recalcul KPI final ───────────────────────────────────────────
-    _recalculate_kpis(conn)
+    # ── Étape 4 : recalcul KPI final ───────────────────────────────────────────
+    _recalculate_kpis()
 
-    # ── Étape 6 : répartition par disque (SSD/HDD) ─────────────────────────────
-    _scan_disks(conn)
+    # ── Étape 5 : répartition par disque (SSD/HDD) ─────────────────────────────
+    _scan_disks()
 
     # ── Bilan final ────────────────────────────────────────────────────────────
-    _print_summary(conn, len(to_scan), valid_count, total_duration_sec,
+    _print_summary(len(to_scan), valid_count, total_duration_sec,
                     clean_duration_sec, time.monotonic() - t0)
-    conn.close()
 
 
 # ── Mode --watch : surveillance continue ──────────────────────────────────────
+
+def _fetch_and_process(fname: str) -> tuple:
+    """Lit analysis.json/config.json localement, évalue le score, puis
+    POST le résultat au backend. Retourne (fname, success, msg)."""
+    base = Path(SESSIONS_DIR) / fname
+    try:
+        with open(base / "analysis.json", "r", encoding="utf-8") as f:
+            analysis = json.load(f)
+    except Exception:
+        return fname, False, "analysis illisible"
+
+    config = None
+    cp = base / "config.json"
+    if cp.exists():
+        try:
+            with open(cp, "r", encoding="utf-8") as f:
+                config = json.load(f)
+        except Exception:
+            pass
+
+    size_bytes = _get_folder_size(fname)
+    score, grade, errors, warnings = _evaluate_session(base, analysis, config)
+
+    success, session_id, created, err = _post_scan_result(
+        fname, score, grade, errors, len(warnings), size_bytes, config,
+    )
+    if not success:
+        return fname, False, err
+
+    flag = "ERREURS" if errors else f"{len(warnings)}w" if warnings else "OK"
+    return fname, True, f"score={score} grade={grade} [{flag}]"
+
 
 def watch_loop():
     """
@@ -1093,8 +832,8 @@ def watch_loop():
     Détecte les nouveaux dossiers, attend la stabilité d'analysis.json,
     puis traite avec un ThreadPoolExecutor.
     """
-    logger.info("=== fs_scanner --watch | intervalle=%ds stabilité=%ds dir=%s ===",
-                SCAN_INTERVAL, STABILITY_SECONDS, SESSIONS_DIR)
+    logger.info("=== fs_scanner --watch | intervalle=%ds stabilité=%ds dir=%s backend=%s ===",
+                SCAN_INTERVAL, STABILITY_SECONDS, SESSIONS_DIR, BACKEND_URL)
 
     processed: set   = _load_already_scored()
     # {folder_name: (size, mtime, first_stable_ts)}
@@ -1104,18 +843,14 @@ def watch_loop():
     logger.info("%d session(s) déjà traitées", len(processed))
 
     last_disk_scan = 0.0
+    last_kpi_recalc = 0.0
 
     while True:
         now = time.monotonic()
 
         # ── 0. Répartition par disque (SSD/HDD), throttlée ─────────────────────
         if now - last_disk_scan >= DISK_SCAN_INTERVAL:
-            try:
-                disk_conn = _pg_connect()
-                _scan_disks(disk_conn)
-                disk_conn.close()
-            except Exception:
-                logger.exception("Connexion DB échouée pour le scan des disques")
+            _scan_disks()
             last_disk_scan = now
 
         # ── 1. Vérifier stabilité en parallèle ─────────────────────────────────
@@ -1145,84 +880,7 @@ def watch_loop():
 
         # ── 2. Traiter les sessions stables ────────────────────────────────────
         if newly_stable:
-            def _fetch_and_process(fname):
-                base = Path(SESSIONS_DIR) / fname
-                try:
-                    with open(base / "analysis.json", "r", encoding="utf-8") as f:
-                        analysis = json.load(f)
-                except Exception:
-                    return fname, False, "analysis illisible"
-
-                config = None
-                cp = base / "config.json"
-                if cp.exists():
-                    try:
-                        with open(cp, "r", encoding="utf-8") as f:
-                            config = json.load(f)
-                    except Exception:
-                        pass
-
-                size_bytes = _get_folder_size(fname)
-                score, grade, errors, warnings = _evaluate_session(base, analysis, config)
-
-                try:
-                    conn = _pg_connect()
-                    _ensure_kpi_table(conn)
-                    with conn:
-                        with conn.cursor() as cur:
-                            session_id = _resolve_session_id(cur, fname, analysis)
-                            if not session_id:
-                                if config:
-                                    session_id = _create_session_from_config(cur, fname, config)
-                                else:
-                                    return fname, False, "session introuvable"
-
-                            _write_session(cur, fname, session_id, score, grade,
-                                           errors, len(warnings), size_bytes)
-
-                            # KPI incrémental (une seule session à la fois)
-                            cur.execute(
-                                "SELECT project_id, site_id, started_at::date "
-                                "FROM sessions WHERE session_id = %s", (session_id,)
-                            )
-                            row = cur.fetchone()
-                            if row:
-                                pid, sid, sdate = row
-                                pid   = pid   or "unknown"
-                                sid   = sid   or "default"
-                                sdate = sdate or datetime.now(timezone.utc).date()
-                                gcol  = f"grade_{grade.lower()}_count"
-                                cur.execute(f"""
-                                    INSERT INTO kpi_quality_snapshots AS kq
-                                        (project_id, site_id, snapshot_date,
-                                         session_count, scored_count,
-                                         avg_score, min_score, max_score,
-                                         grade_a_count, grade_b_count, grade_c_count,
-                                         grade_d_count, grade_f_count,
-                                         errors_count, warnings_count, updated_at)
-                                    VALUES (%s,%s,%s, 1,1, %s,%s,%s, 0,0,0,0,0, %s,%s, now())
-                                    ON CONFLICT (project_id, site_id, snapshot_date) DO UPDATE SET
-                                        session_count  = kq.session_count + 1,
-                                        scored_count   = kq.scored_count  + 1,
-                                        avg_score      = (kq.avg_score * kq.scored_count
-                                                          + EXCLUDED.avg_score)
-                                                         / (kq.scored_count + 1),
-                                        min_score      = LEAST(kq.min_score, EXCLUDED.min_score),
-                                        max_score      = GREATEST(kq.max_score, EXCLUDED.max_score),
-                                        {gcol}         = kq.{gcol} + 1,
-                                        errors_count   = kq.errors_count   + EXCLUDED.errors_count,
-                                        warnings_count = kq.warnings_count + EXCLUDED.warnings_count,
-                                        updated_at     = now()
-                                """, (pid, sid, sdate, score, score, score,
-                                      len(errors), len(warnings)))
-                    conn.close()
-                    flag = "ERREURS" if errors else f"{len(warnings)}w" if warnings else "OK"
-                    return fname, True, f"score={score} grade={grade} [{flag}]"
-
-                except Exception as exc:
-                    return fname, False, str(exc)
-
-            with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, len(newly_stable))) as pool:
+            with ThreadPoolExecutor(max_workers=min(HTTP_WORKERS, len(newly_stable))) as pool:
                 for fname, success, msg in pool.map(_fetch_and_process, newly_stable):
                     if success:
                         processed.add(fname)
@@ -1234,38 +892,22 @@ def watch_loop():
         # ── 3. Retry pending_db ─────────────────────────────────────────────────
         if pending_db:
             still_pending = set()
-            for fname in list(pending_db):
-                base = Path(SESSIONS_DIR) / fname
-                try:
-                    with open(base / "analysis.json", "r", encoding="utf-8") as f:
-                        analysis = json.load(f)
-                    cp = base / "config.json"
-                    config = None
-                    if cp.exists():
-                        with open(cp, "r", encoding="utf-8") as f:
-                            config = json.load(f)
-                    score, grade, errors, warnings = _evaluate_session(base, analysis, config)
-                    conn = _pg_connect()
-                    with conn:
-                        with conn.cursor() as cur:
-                            session_id = _resolve_session_id(cur, fname, analysis)
-                            if not session_id:
-                                if config:
-                                    session_id = _create_session_from_config(cur, fname, config)
-                                else:
-                                    still_pending.add(fname)
-                                    conn.close()
-                                    continue
-                            _write_session(cur, fname, session_id, score, grade,
-                                           errors, len(warnings))
-                    conn.close()
-                    processed.add(fname)
-                except Exception as exc:
-                    logger.debug("%s : retry DB échoué — %s", fname, exc)
-                    still_pending.add(fname)
+            with ThreadPoolExecutor(max_workers=min(HTTP_WORKERS, len(pending_db))) as pool:
+                results = pool.map(_fetch_and_process, list(pending_db))
+                for fname, success, msg in results:
+                    if success:
+                        processed.add(fname)
+                    else:
+                        logger.debug("%s : retry échoué — %s", fname, msg)
+                        still_pending.add(fname)
             pending_db = still_pending
 
-        # ── 4. Nouvelles sessions ───────────────────────────────────────────────
+        # ── 4. Recalcul KPI, throttlé ────────────────────────────────────────────
+        if newly_stable and now - last_kpi_recalc >= KPI_RECALC_INTERVAL:
+            _recalculate_kpis()
+            last_kpi_recalc = now
+
+        # ── 5. Nouvelles sessions ───────────────────────────────────────────────
         sessions  = _list_sessions(SESSIONS_DIR)
         new_found = 0
         for fname in sessions:

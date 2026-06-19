@@ -57,6 +57,9 @@ UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "3"))
 # Backend API
 # ---------------------------------------------------------------------------
 
+OFFLINE = False  # quand True : aucun appel réseau vers BACKEND_URL (register/mark-sent/mark-failed)
+
+
 def db_register_session(session_dir: Path) -> str | None:
     """
     Enregistre/relie la session en BDD via le backend, comme le fait
@@ -67,6 +70,9 @@ def db_register_session(session_dir: Path) -> str | None:
     si la session n'existe pas encore en BDD). Retourne le session_id DB,
     ou None en cas d'échec / analysis.json manquant.
     """
+    if OFFLINE:
+        return None
+
     analysis_path = session_dir / "analysis.json"
     if not analysis_path.exists():
         return None
@@ -128,6 +134,9 @@ def api_mark_sent(session_ref: str, size_bytes: int, duration_seconds: float) ->
     Appelle le backend pour marquer la session comme envoyée au client Mistral.
     'session_ref' : session_id DB ou nom de dossier NAS (session_folder).
     """
+    if OFFLINE:
+        return True
+
     try:
         r = requests.post(
             f"{BACKEND_URL}/pipeline/sessions/{session_ref}/mark-sent",
@@ -152,6 +161,9 @@ def api_mark_sent(session_ref: str, size_bytes: int, duration_seconds: float) ->
 
 def api_mark_send_failed(session_ref: str) -> None:
     """Appelle le backend pour marquer l'envoi de la session comme échoué."""
+    if OFFLINE:
+        return
+
     try:
         r = requests.post(
             f"{BACKEND_URL}/pipeline/sessions/{session_ref}/mark-send-failed",
@@ -583,11 +595,26 @@ def main() -> None:
     parser.add_argument("--all", action="store_true",
                         help="Envoie toutes les sessions valides, sans plafond de volume "
                              "(ignore MAX_RUN_GB). Combinable avec --max-sessions.")
+    parser.add_argument("--workers", type=int, default=UPLOAD_WORKERS,
+                        help=f"Nombre de threads d'upload en parallèle (défaut : {UPLOAD_WORKERS}, "
+                             "surchargeable aussi via UPLOAD_WORKERS)")
+    parser.add_argument("--analyze-processes", type=int, default=ANALYZE_PROCESSES,
+                        help=f"Nombre de processus d'analyse en parallèle (défaut : {ANALYZE_PROCESSES})")
+    parser.add_argument("--offline", action="store_true",
+                        help="Désactive tous les appels réseau vers BACKEND_URL "
+                             "(register/mark-sent/mark-send-failed). Le suivi des sessions "
+                             "envoyées reste fait localement via le fichier de dodge. "
+                             "À utiliser quand BACKEND_URL est lent/indisponible (ex. ngrok).")
     args = parser.parse_args()
+
+    global OFFLINE
+    OFFLINE = args.offline
 
     dry_run = args.dry_run
     max_sessions = args.max_sessions
     send_all = args.all
+    upload_workers = max(1, args.workers)
+    analyze_processes = max(1, args.analyze_processes)
     max_run_bytes = float("inf") if send_all else MAX_RUN_BYTES
     root = Path(args.dossier)
 
@@ -597,6 +624,8 @@ def main() -> None:
 
     if dry_run:
         print("*** MODE DRY-RUN — aucun upload, aucun déplacement, aucune écriture DB/persistance ***\n")
+    if OFFLINE:
+        print("*** MODE OFFLINE — aucun appel à BACKEND_URL (register/mark-sent/mark-send-failed) ***\n")
 
     sent_dir = root.parent / "session_envoye"
 
@@ -630,8 +659,8 @@ def main() -> None:
     candidates_iter = iter(candidates)
 
     with tempfile.TemporaryDirectory() as tmp_dir, \
-            ProcessPoolExecutor(max_workers=ANALYZE_PROCESSES) as analysis_pool, \
-            ThreadPoolExecutor(max_workers=UPLOAD_WORKERS) as upload_pool:
+            ProcessPoolExecutor(max_workers=analyze_processes) as analysis_pool, \
+            ThreadPoolExecutor(max_workers=upload_workers) as upload_pool:
 
         def _upload_one(session_dir: Path, size: int) -> tuple:
             name = session_dir.name
@@ -641,7 +670,9 @@ def main() -> None:
             if dry_run:
                 return (session_dir, size, duration, db_session_id, "dry-run", 0)
 
-            if db_session_id:
+            if OFFLINE:
+                pass  # pas d'appel backend — rien à logger ici
+            elif db_session_id:
                 print(f"  [{name}] DB session_id : {db_session_id}", flush=True)
             else:
                 print(f"  [{name}] Avertissement : session introuvable/non enregistrée en DB — upload sans mise à jour DB", flush=True)
@@ -673,7 +704,7 @@ def main() -> None:
             pending[fut] = ("analyze", s)
 
         # Amorce le pipeline d'analyse (fenêtre glissante, pas d'attente globale)
-        for _ in range(max(ANALYZE_PROCESSES * 2, 1)):
+        for _ in range(max(analyze_processes * 2, 1)):
             submit_next_analysis()
 
         while pending:
