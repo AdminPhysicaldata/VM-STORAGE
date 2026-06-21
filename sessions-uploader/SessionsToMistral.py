@@ -13,6 +13,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -50,7 +51,12 @@ METADATA_ONLY_FILES = {"metadata.json"}
 ANALYZE_PROCESSES = int(os.environ.get("ANALYZE_PROCESSES", str(min(4, max(1, cpu_count() or 1)))))
 
 # Parallélisme — envoi (zip + upload réseau) : threads, l'I/O réseau libère le GIL
-UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "3"))
+UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "12"))
+
+# Taille des lots envoyés au backend (register/mark-sent/mark-send-failed) :
+# un seul appel HTTP toutes les BACKEND_BATCH_SIZE sessions plutôt qu'un
+# appel par session, pour limiter le nombre de requêtes vers BACKEND_URL.
+BACKEND_BATCH_SIZE = int(os.environ.get("BACKEND_BATCH_SIZE", "500"))
 
 
 # ---------------------------------------------------------------------------
@@ -60,36 +66,100 @@ UPLOAD_WORKERS = int(os.environ.get("UPLOAD_WORKERS", "3"))
 OFFLINE = False  # quand True : aucun appel réseau vers BACKEND_URL (register/mark-sent/mark-failed)
 
 
-def db_register_session(session_dir: Path) -> str | None:
+def _backend_headers() -> dict:
+    headers = {"Content-Type": "application/json"}
+    if INTERNAL_API_TOKEN:
+        headers["X-Internal-Token"] = INTERNAL_API_TOKEN
+    return headers
+
+
+# ---------------------------------------------------------------------------
+# Validation/correction du config.json — cohérence rig <-> opérateur
+# ---------------------------------------------------------------------------
+
+def _expected_rig_num(operator_id: str | None) -> int | None:
     """
-    Enregistre/relie la session en BDD via le backend, comme le fait
-    sftp_scanner.py (résolution ou création, scoring depuis analysis.json,
-    mise à jour session_folder/size_bytes/quality_score/pipeline_status).
-
-    Lit analysis.json (requis) et config.json (optionnel, pour la création
-    si la session n'existe pas encore en BDD). Retourne le session_id DB,
-    ou None en cas d'échec / analysis.json manquant.
+    Règle métier : rig_id = operator_id si 0-30, sinon operator_id - 30.
+    'operator_id' est de la forme 'op_45'. Retourne None si non parsable.
     """
-    if OFFLINE:
+    m = re.search(r"(\d+)", operator_id or "")
+    if not m:
         return None
+    opnum = int(m.group(1))
+    return opnum if opnum <= 30 else opnum - 30
 
-    analysis_path = session_dir / "analysis.json"
-    if not analysis_path.exists():
-        return None
 
-    try:
-        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
-    except Exception as exc:
-        logging.warning("  Impossible de lire analysis.json pour '%s': %s", session_dir.name, exc)
-        return None
+def fix_rig_config(config: dict, session_name: str) -> bool:
+    """
+    Corrige config["rig"]["rig_id"]/["code"] uniquement dans les cas où le
+    rig est absent ou vaut le placeholder par défaut du logiciel de capture
+    ('rig_1') — un rig déjà renseigné avec une autre valeur est considéré
+    comme volontaire et n'est jamais modifié, même incohérent avec la règle
+    operator_id±30.
+    Retourne True si une correction a été appliquée.
+    """
+    operator = config.get("operator") or {}
+    rig = config.get("rig")
 
+    current_rig_id = (rig or {}).get("rig_id") or ""
+    m = re.search(r"(\d+)", current_rig_id)
+    current_num = int(m.group(1)) if m else None
+
+    if current_num is not None and current_num != 1:
+        return False  # rig déjà renseigné avec une valeur volontaire — on ne touche pas
+
+    expected = _expected_rig_num(operator.get("operator_id"))
+    if expected is None:
+        return False
+
+    if current_num == expected:
+        return False
+
+    new_rig_id = f"rig_{expected}"
+    new_code = f"RIG-{expected}"
+    logging.warning(
+        "  [%s] rig %s avec operator_id='%s' : '%s' → corrigé en '%s'",
+        session_name,
+        "absent" if rig is None else "manquant" if current_num is None else "== 1 (placeholder)",
+        operator.get("operator_id"), current_rig_id or "(absent)", new_rig_id,
+    )
+    if rig is None:
+        rig = {}
+        config["rig"] = rig
+    rig["rig_id"] = new_rig_id
+    rig["code"] = new_code
+    return True
+
+
+def read_session_metadata(session_dir: Path, dry_run: bool = False) -> tuple[dict | None, dict | None, dict | None]:
+    """
+    Lit config.json, mission.json et analysis.json (requis pour le register).
+    Si config.json est présent, vérifie/corrige la cohérence rig <-> opérateur
+    (fix_rig_config) et réécrit le fichier sur disque si une correction a été
+    appliquée et que dry_run est False — la correction doit être faite avant
+    le zip pour se propager dans l'archive envoyée.
+
+    Retourne (analysis, config, mission). 'analysis' est None si
+    analysis.json est manquant/illisible (la session ne sera alors pas
+    enregistrée via register-bulk, mais config est tout de même corrigé).
+    """
     config = None
     config_path = session_dir / "config.json"
     if config_path.exists():
         try:
             config = json.loads(config_path.read_text(encoding="utf-8"))
-        except Exception:
+        except Exception as exc:
+            logging.warning("  Impossible de lire config.json pour '%s': %s", session_dir.name, exc)
             config = None
+
+    if config is not None and fix_rig_config(config, session_dir.name):
+        if dry_run:
+            logging.info("  [%s] dry-run — correction rig non écrite sur disque", session_dir.name)
+        else:
+            try:
+                config_path.write_text(json.dumps(config, indent=2, ensure_ascii=False), encoding="utf-8")
+            except Exception as exc:
+                logging.warning("  Impossible d'écrire config.json corrigé pour '%s': %s", session_dir.name, exc)
 
     mission = None
     mission_path = session_dir / "mission.json"
@@ -99,84 +169,101 @@ def db_register_session(session_dir: Path) -> str | None:
         except Exception:
             mission = None
 
-    size_bytes = sum(f.stat().st_size for f in session_dir.rglob("*") if f.is_file())
+    analysis_path = session_dir / "analysis.json"
+    if not analysis_path.exists():
+        return None, config, mission
+    try:
+        analysis = json.loads(analysis_path.read_text(encoding="utf-8"))
+    except Exception as exc:
+        logging.warning("  Impossible de lire analysis.json pour '%s': %s", session_dir.name, exc)
+        return None, config, mission
 
+    return analysis, config, mission
+
+
+def db_register_sessions_bulk(items: list[dict]) -> dict[str, str | None]:
+    """
+    Enregistre/relie un lot de sessions en BDD via /register-bulk.
+    items : [{"folder_name", "analysis", "config", "mission", "size_bytes"}, ...]
+    Retourne folder_name -> session_id (None en cas d'échec pour cet item).
+    """
+    if OFFLINE or not items:
+        return {}
     try:
         r = requests.post(
-            f"{BACKEND_URL}/pipeline/sessions/register",
-            json={
-                "folder_name": session_dir.name,
-                "analysis": analysis,
-                "config": config,
-                "mission": mission,
-                "size_bytes": size_bytes,
-            },
+            f"{BACKEND_URL}/pipeline/sessions/register-bulk",
+            json={"sessions": items},
             headers=_backend_headers(),
-            timeout=15,
+            timeout=60,
         )
         if r.status_code == 200:
-            return r.json().get("session_id")
-        logging.warning("  Backend erreur (register) [%s]: %s", r.status_code, r.text)
+            out: dict[str, str | None] = {}
+            for res in r.json().get("results", []):
+                fname = res.get("folder_name")
+                if res.get("error"):
+                    logging.warning("  Backend erreur (register-bulk) '%s': %s", fname, res["error"])
+                    out[fname] = None
+                else:
+                    out[fname] = res.get("session_id")
+            return out
+        logging.warning("  Backend erreur (register-bulk) [%s]: %s", r.status_code, r.text)
     except requests.RequestException as exc:
-        logging.warning("  Backend: impossible d'enregistrer la session '%s': %s", session_dir.name, exc)
-    return None
+        logging.warning("  Backend: échec register-bulk (%d session(s)) : %s", len(items), exc)
+    return {item["folder_name"]: None for item in items}
 
 
-def _backend_headers() -> dict:
-    headers = {"Content-Type": "application/json"}
-    if INTERNAL_API_TOKEN:
-        headers["X-Internal-Token"] = INTERNAL_API_TOKEN
-    return headers
-
-
-def api_mark_sent(session_ref: str, size_bytes: int, duration_seconds: float) -> bool:
+def api_mark_sent_bulk(deliveries: list[dict]) -> None:
     """
-    Appelle le backend pour marquer la session comme envoyée au client Mistral.
-    'session_ref' : session_id DB ou nom de dossier NAS (session_folder).
+    Marque un lot de sessions comme envoyées au client Mistral via /mark-sent-bulk.
+    deliveries : [{"session_ref", "size_bytes", "duration_seconds"}, ...]
     """
-    if OFFLINE:
-        return True
-
+    if OFFLINE or not deliveries:
+        return
     try:
         r = requests.post(
-            f"{BACKEND_URL}/pipeline/sessions/{session_ref}/mark-sent",
+            f"{BACKEND_URL}/pipeline/sessions/mark-sent-bulk",
             json={
                 "client_id": MISTRAL_CLIENT_ID,
                 "client_name": MISTRAL_CLIENT_NAME,
-                "size_bytes": size_bytes,
-                "duration_seconds": duration_seconds,
+                "deliveries": deliveries,
             },
             headers=_backend_headers(),
-            timeout=10,
+            timeout=60,
         )
         if r.status_code == 200:
-            logging.info("  Backend: %s → delivered (client: %s)", session_ref, MISTRAL_CLIENT_ID)
-            return True
-        logging.warning("  Backend erreur (mark-sent) [%s]: %s", r.status_code, r.text)
-        return False
+            for res in r.json().get("results", []):
+                if res.get("error"):
+                    logging.warning("  Backend erreur (mark-sent-bulk) '%s': %s",
+                                     res.get("session_ref"), res["error"])
+            logging.info("  Backend: %d session(s) → delivered (client: %s)",
+                         len(deliveries), MISTRAL_CLIENT_ID)
+        else:
+            logging.warning("  Backend erreur (mark-sent-bulk) [%s]: %s", r.status_code, r.text)
     except requests.RequestException as exc:
-        logging.error("  Backend erreur (mark-sent) : %s", exc)
-        return False
+        logging.error("  Backend erreur (mark-sent-bulk) : %s", exc)
 
 
-def api_mark_send_failed(session_ref: str) -> None:
-    """Appelle le backend pour marquer l'envoi de la session comme échoué."""
-    if OFFLINE:
+def api_mark_send_failed_bulk(session_refs: list[str]) -> None:
+    """Marque un lot d'envois comme échoués via /mark-send-failed-bulk."""
+    if OFFLINE or not session_refs:
         return
-
     try:
         r = requests.post(
-            f"{BACKEND_URL}/pipeline/sessions/{session_ref}/mark-send-failed",
-            json={"client_id": MISTRAL_CLIENT_ID},
+            f"{BACKEND_URL}/pipeline/sessions/mark-send-failed-bulk",
+            json={"client_id": MISTRAL_CLIENT_ID, "session_refs": session_refs},
             headers=_backend_headers(),
-            timeout=10,
+            timeout=60,
         )
         if r.status_code == 200:
-            logging.info("  Backend: %s → delivery_failed", session_ref)
+            for res in r.json().get("results", []):
+                if res.get("error"):
+                    logging.warning("  Backend erreur (mark-send-failed-bulk) '%s': %s",
+                                     res.get("session_ref"), res["error"])
+            logging.info("  Backend: %d session(s) → delivery_failed", len(session_refs))
         else:
-            logging.warning("  Backend erreur (mark-send-failed) [%s]: %s", r.status_code, r.text)
+            logging.warning("  Backend erreur (mark-send-failed-bulk) [%s]: %s", r.status_code, r.text)
     except requests.RequestException as exc:
-        logging.error("  Backend erreur (mark-send-failed) : %s", exc)
+        logging.error("  Backend erreur (mark-send-failed-bulk) : %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -571,9 +658,14 @@ def zip_session(session_dir: Path, tmp_dir: Path) -> Path:
     make_archive() fait os.chdir() — non thread-safe avec UPLOAD_WORKERS > 1
     (plusieurs threads se marchent sur le cwd du process, d'où
     'FileNotFoundError: ... sessions').
+
+    ZIP_STORED (pas de compression) : le contenu est presque exclusivement
+    des .mp4 déjà compressés, donc ZIP_DEFLATED ne réduisait quasiment pas
+    la taille tout en consommant du CPU pour rien — le serveur destinataire
+    attend un .zip, peu importe sa méthode de compression interne.
     """
     zip_path = tmp_dir / f"{session_dir.name}.zip"
-    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_STORED) as zf:
         for f in session_dir.rglob("*"):
             if f.is_file():
                 zf.write(f, Path(session_dir.name) / f.relative_to(session_dir))
@@ -655,6 +747,51 @@ def main() -> None:
     sent_this_run: list[tuple[str, int, float]] = []
     failed_names: list[str] = []
 
+    # Sessions uploadées en attente de synchronisation backend (register +
+    # mark-sent/mark-send-failed), regroupées par lots de BACKEND_BATCH_SIZE
+    # pour limiter le nombre d'appels HTTP vers BACKEND_URL.
+    pending_backend: list[dict] = []
+
+    def flush_backend_batch() -> None:
+        if not pending_backend or OFFLINE:
+            pending_backend.clear()
+            return
+
+        batch = list(pending_backend)
+        pending_backend.clear()
+
+        register_items = [
+            {
+                "folder_name": e["name"],
+                "analysis": e["analysis"],
+                "config": e["config"],
+                "mission": e["mission"],
+                "size_bytes": e["size"],
+            }
+            for e in batch if e["analysis"] is not None
+        ]
+        session_ids = db_register_sessions_bulk(register_items)
+
+        delivered = []
+        failed_refs = []
+        for e in batch:
+            ref = session_ids.get(e["name"]) or e["name"]
+            if e["status"] == "ok":
+                delivered.append({
+                    "session_ref": ref,
+                    "size_bytes": e["zip_size"],
+                    "duration_seconds": e["duration"],
+                })
+            else:
+                failed_refs.append(ref)
+
+        api_mark_sent_bulk(delivered)
+        api_mark_send_failed_bulk(failed_refs)
+
+        print(f"  [batch backend] {len(batch)} session(s) synchronisée(s) "
+              f"({len(register_items)} register, {len(delivered)} mark-sent, "
+              f"{len(failed_refs)} mark-send-failed)", flush=True)
+
     total = len(candidates)
     candidates_iter = iter(candidates)
 
@@ -664,18 +801,16 @@ def main() -> None:
 
         def _upload_one(session_dir: Path, size: int) -> tuple:
             name = session_dir.name
-            db_session_id = db_register_session(session_dir)
+            # Lu/corrigé même en OFFLINE : la correction du rig doit se propager
+            # dans l'archive envoyée à Mistral, indépendamment du suivi backend.
+            analysis, config, mission = read_session_metadata(session_dir, dry_run=dry_run)
             duration = read_duration(session_dir)
 
             if dry_run:
-                return (session_dir, size, duration, db_session_id, "dry-run", 0)
+                return (session_dir, size, duration, analysis, config, mission, "dry-run", 0)
 
-            if OFFLINE:
-                pass  # pas d'appel backend — rien à logger ici
-            elif db_session_id:
-                print(f"  [{name}] DB session_id : {db_session_id}", flush=True)
-            else:
-                print(f"  [{name}] Avertissement : session introuvable/non enregistrée en DB — upload sans mise à jour DB", flush=True)
+            if not OFFLINE and analysis is None:
+                print(f"  [{name}] Avertissement : analysis.json manquant/illisible — upload sans mise à jour DB", flush=True)
 
             zip_path = zip_session(session_dir, Path(tmp_dir))
             zip_size = zip_path.stat().st_size
@@ -684,13 +819,8 @@ def main() -> None:
             success = upload_zip_to_mistral(str(zip_path))
             zip_path.unlink(missing_ok=True)
 
-            session_ref = db_session_id or name
-            if success:
-                api_mark_sent(session_ref, zip_size, duration)
-            else:
-                api_mark_send_failed(session_ref)
-
-            return (session_dir, size, duration, db_session_id, "ok" if success else "failed", zip_size)
+            return (session_dir, size, duration, analysis, config, mission,
+                     "ok" if success else "failed", zip_size)
 
         # pending : future -> ("analyze", session_dir) | ("upload",)
         pending: dict = {}
@@ -764,13 +894,13 @@ def main() -> None:
                     continue
 
                 # tag == "upload"
-                session_dir, size, duration, db_session_id, status, zip_size = fut.result()
+                session_dir, size, duration, analysis, config, mission, status, zip_size = fut.result()
                 name = session_dir.name
 
                 if status == "dry-run":
                     print(f"  [{name}] VALIDE — serait envoyée ({format_size(size)}, {format_duration(duration)})")
-                    if db_session_id:
-                        print(f"           DB → {db_session_id}")
+                    if analysis is not None:
+                        print("           DB → serait enregistrée (analysis.json présent)")
                     else:
                         print("           DB → introuvable (upload sans mise à jour DB)")
                     print(flush=True)
@@ -783,7 +913,22 @@ def main() -> None:
                 else:
                     failed_names.append(name)
 
+                pending_backend.append({
+                    "name": name,
+                    "analysis": analysis,
+                    "config": config,
+                    "mission": mission,
+                    "size": size,
+                    "duration": duration,
+                    "status": status,
+                    "zip_size": zip_size,
+                })
+                if len(pending_backend) >= BACKEND_BATCH_SIZE:
+                    flush_backend_batch()
+
                 print(flush=True)
+
+        flush_backend_batch()
 
     if dry_run:
         print("*** DRY-RUN terminé — rien n'a été modifié ***")
