@@ -17,6 +17,7 @@ import re
 import shutil
 import sys
 import tempfile
+import time
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
 from multiprocessing import cpu_count
@@ -264,6 +265,68 @@ def api_mark_send_failed_bulk(session_refs: list[str]) -> None:
             logging.warning("  Backend erreur (mark-send-failed-bulk) [%s]: %s", r.status_code, r.text)
     except requests.RequestException as exc:
         logging.error("  Backend erreur (mark-send-failed-bulk) : %s", exc)
+
+
+# ---------------------------------------------------------------------------
+# Upload runs — suivi de cette exécution comme entité groupée côté backend
+# (affichée dans la page /clients : statut validé/en cours/avorté + barre
+# de progression, alimentée par des heartbeats périodiques).
+# ---------------------------------------------------------------------------
+
+HEARTBEAT_INTERVAL_SECONDS = 5
+
+
+def start_upload_run(total_sessions: int) -> str | None:
+    """Démarre le suivi du run. Retourne le run_id, ou None si indisponible."""
+    try:
+        r = requests.post(
+            f"{BACKEND_URL}/pipeline/uploads/runs/start",
+            json={"client_id": MISTRAL_CLIENT_ID, "total_sessions": total_sessions},
+            headers=_backend_headers(),
+            timeout=10,
+        )
+        if r.status_code == 200:
+            return r.json().get("run_id")
+        logging.warning("  Backend erreur (run start) [%s]: %s", r.status_code, r.text)
+    except requests.RequestException as exc:
+        logging.warning("  Backend: impossible de démarrer le suivi du run : %s", exc)
+    return None
+
+
+def send_run_progress(run_id: str, processed_count: int, sent_count: int, failed_count: int) -> None:
+    """Heartbeat de progression — fire-and-forget, ne doit jamais bloquer le run."""
+    try:
+        requests.post(
+            f"{BACKEND_URL}/pipeline/uploads/runs/{run_id}/progress",
+            json={
+                "processed_count": processed_count,
+                "sent_count": sent_count,
+                "failed_count": failed_count,
+            },
+            headers=_backend_headers(),
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        logging.warning("  Backend: échec de la mise à jour de progression (run %s) : %s", run_id, exc)
+
+
+def finish_upload_run(run_id: str, status: str, processed_count: int, sent_count: int,
+                       failed_count: int, error_msg: str | None = None) -> None:
+    try:
+        requests.post(
+            f"{BACKEND_URL}/pipeline/uploads/runs/{run_id}/finish",
+            json={
+                "status": status,
+                "processed_count": processed_count,
+                "sent_count": sent_count,
+                "failed_count": failed_count,
+                "error_msg": error_msg,
+            },
+            headers=_backend_headers(),
+            timeout=10,
+        )
+    except requests.RequestException as exc:
+        logging.warning("  Backend: échec de la clôture du run %s : %s", run_id, exc)
 
 
 # ---------------------------------------------------------------------------
@@ -795,140 +858,158 @@ def main() -> None:
     total = len(candidates)
     candidates_iter = iter(candidates)
 
-    with tempfile.TemporaryDirectory() as tmp_dir, \
-            ProcessPoolExecutor(max_workers=analyze_processes) as analysis_pool, \
-            ThreadPoolExecutor(max_workers=upload_workers) as upload_pool:
+    run_id = None if (dry_run or OFFLINE) else start_upload_run(total)
+    last_heartbeat_ts = time.monotonic()
 
-        def _upload_one(session_dir: Path, size: int) -> tuple:
-            name = session_dir.name
-            # Lu/corrigé même en OFFLINE : la correction du rig doit se propager
-            # dans l'archive envoyée à Mistral, indépendamment du suivi backend.
-            analysis, config, mission = read_session_metadata(session_dir, dry_run=dry_run)
-            duration = read_duration(session_dir)
+    try:
+        with tempfile.TemporaryDirectory() as tmp_dir, \
+                ProcessPoolExecutor(max_workers=analyze_processes) as analysis_pool, \
+                ThreadPoolExecutor(max_workers=upload_workers) as upload_pool:
 
-            if dry_run:
-                return (session_dir, size, duration, analysis, config, mission, "dry-run", 0)
-
-            if not OFFLINE and analysis is None:
-                print(f"  [{name}] Avertissement : analysis.json manquant/illisible — upload sans mise à jour DB", flush=True)
-
-            zip_path = zip_session(session_dir, Path(tmp_dir))
-            zip_size = zip_path.stat().st_size
-            print(f"  [{name}] Archive : {zip_path.name}  ({format_size(zip_size)})", flush=True)
-
-            success = upload_zip_to_mistral(str(zip_path))
-            zip_path.unlink(missing_ok=True)
-
-            return (session_dir, size, duration, analysis, config, mission,
-                     "ok" if success else "failed", zip_size)
-
-        # pending : future -> ("analyze", session_dir) | ("upload",)
-        pending: dict = {}
-
-        def submit_next_analysis() -> None:
-            try:
-                s = next(candidates_iter)
-            except StopIteration:
-                return
-            fut = analysis_pool.submit(_analyze_one, str(s))
-            pending[fut] = ("analyze", s)
-
-        # Amorce le pipeline d'analyse (fenêtre glissante, pas d'attente globale)
-        for _ in range(max(analyze_processes * 2, 1)):
-            submit_next_analysis()
-
-        while pending:
-            done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
-            for fut in done:
-                tag, *rest = pending.pop(fut)
-
-                if tag == "analyze":
-                    session_dir, = rest
-                    name = session_dir.name
-                    _, kind, detail = fut.result()
-                    processed_count += 1
-                    print(f"[{processed_count}/{total}] {name}", flush=True)
-
-                    if kind == "invalid":
-                        print("  INVALIDE — structure incomplète/corrompue :")
-                        for issue in detail:
-                            print(f"    - {issue}")
-                        if not dry_run:
-                            mark_skipped(root, dodge, name, kind, detail)
-                        print(flush=True)
-                        submit_next_analysis()
-                        continue
-
-                    if kind == "rejected":
-                        print("  REJET — erreurs dans analysis.json :")
-                        for err in detail:
-                            print(f"    - {err}")
-                        if not dry_run:
-                            mark_skipped(root, dodge, name, kind, detail)
-                        print(flush=True)
-                        submit_next_analysis()
-                        continue
-
-                    if kind == "empty":
-                        print(f"  VIDE — {detail}")
-                        if not dry_run:
-                            mark_skipped(root, dodge, name, kind, detail)
-                        print(flush=True)
-                        submit_next_analysis()
-                        continue
-
-                    # kind == "valid" → detail = taille en octets
-                    size = detail
-                    if (max_sessions > 0 and sent_count >= max_sessions) or cumul_bytes + size > max_run_bytes:
-                        capped_count += 1
-                        print(f"  Plafond atteint — reporté au prochain run ({format_size(size)})", flush=True)
-                        print(flush=True)
-                        submit_next_analysis()
-                        continue
-
-                    sent_count += 1
-                    cumul_bytes += size
-                    ufut = upload_pool.submit(_upload_one, session_dir, size)
-                    pending[ufut] = ("upload",)
-                    submit_next_analysis()
-                    continue
-
-                # tag == "upload"
-                session_dir, size, duration, analysis, config, mission, status, zip_size = fut.result()
+            def _upload_one(session_dir: Path, size: int) -> tuple:
                 name = session_dir.name
+                # Lu/corrigé même en OFFLINE : la correction du rig doit se propager
+                # dans l'archive envoyée à Mistral, indépendamment du suivi backend.
+                analysis, config, mission = read_session_metadata(session_dir, dry_run=dry_run)
+                duration = read_duration(session_dir)
 
-                if status == "dry-run":
-                    print(f"  [{name}] VALIDE — serait envoyée ({format_size(size)}, {format_duration(duration)})")
-                    if analysis is not None:
-                        print("           DB → serait enregistrée (analysis.json présent)")
+                if dry_run:
+                    return (session_dir, size, duration, analysis, config, mission, "dry-run", 0)
+
+                if not OFFLINE and analysis is None:
+                    print(f"  [{name}] Avertissement : analysis.json manquant/illisible — upload sans mise à jour DB", flush=True)
+
+                zip_path = zip_session(session_dir, Path(tmp_dir))
+                zip_size = zip_path.stat().st_size
+                print(f"  [{name}] Archive : {zip_path.name}  ({format_size(zip_size)})", flush=True)
+
+                success = upload_zip_to_mistral(str(zip_path))
+                zip_path.unlink(missing_ok=True)
+
+                return (session_dir, size, duration, analysis, config, mission,
+                         "ok" if success else "failed", zip_size)
+
+            # pending : future -> ("analyze", session_dir) | ("upload",)
+            pending: dict = {}
+
+            def submit_next_analysis() -> None:
+                try:
+                    s = next(candidates_iter)
+                except StopIteration:
+                    return
+                fut = analysis_pool.submit(_analyze_one, str(s))
+                pending[fut] = ("analyze", s)
+
+            # Amorce le pipeline d'analyse (fenêtre glissante, pas d'attente globale)
+            for _ in range(max(analyze_processes * 2, 1)):
+                submit_next_analysis()
+
+            while pending:
+                done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+
+                if run_id and time.monotonic() - last_heartbeat_ts >= HEARTBEAT_INTERVAL_SECONDS:
+                    send_run_progress(run_id, processed_count, len(sent_this_run), len(failed_names))
+                    last_heartbeat_ts = time.monotonic()
+
+                for fut in done:
+                    tag, *rest = pending.pop(fut)
+
+                    if tag == "analyze":
+                        session_dir, = rest
+                        name = session_dir.name
+                        _, kind, detail = fut.result()
+                        processed_count += 1
+                        print(f"[{processed_count}/{total}] {name}", flush=True)
+
+                        if kind == "invalid":
+                            print("  INVALIDE — structure incomplète/corrompue :")
+                            for issue in detail:
+                                print(f"    - {issue}")
+                            if not dry_run:
+                                mark_skipped(root, dodge, name, kind, detail)
+                            print(flush=True)
+                            submit_next_analysis()
+                            continue
+
+                        if kind == "rejected":
+                            print("  REJET — erreurs dans analysis.json :")
+                            for err in detail:
+                                print(f"    - {err}")
+                            if not dry_run:
+                                mark_skipped(root, dodge, name, kind, detail)
+                            print(flush=True)
+                            submit_next_analysis()
+                            continue
+
+                        if kind == "empty":
+                            print(f"  VIDE — {detail}")
+                            if not dry_run:
+                                mark_skipped(root, dodge, name, kind, detail)
+                            print(flush=True)
+                            submit_next_analysis()
+                            continue
+
+                        # kind == "valid" → detail = taille en octets
+                        size = detail
+                        if (max_sessions > 0 and sent_count >= max_sessions) or cumul_bytes + size > max_run_bytes:
+                            capped_count += 1
+                            print(f"  Plafond atteint — reporté au prochain run ({format_size(size)})", flush=True)
+                            print(flush=True)
+                            submit_next_analysis()
+                            continue
+
+                        sent_count += 1
+                        cumul_bytes += size
+                        ufut = upload_pool.submit(_upload_one, session_dir, size)
+                        pending[ufut] = ("upload",)
+                        submit_next_analysis()
+                        continue
+
+                    # tag == "upload"
+                    session_dir, size, duration, analysis, config, mission, status, zip_size = fut.result()
+                    name = session_dir.name
+
+                    if status == "dry-run":
+                        print(f"  [{name}] VALIDE — serait envoyée ({format_size(size)}, {format_duration(duration)})")
+                        if analysis is not None:
+                            print("           DB → serait enregistrée (analysis.json présent)")
+                        else:
+                            print("           DB → introuvable (upload sans mise à jour DB)")
+                        print(flush=True)
+                        continue
+
+                    if status == "ok":
+                        mark_uploaded(root, dodge, name, zip_size, duration)
+                        move_session_to_sent(session_dir, sent_dir)
+                        sent_this_run.append((name, zip_size, duration))
                     else:
-                        print("           DB → introuvable (upload sans mise à jour DB)")
+                        failed_names.append(name)
+
+                    pending_backend.append({
+                        "name": name,
+                        "analysis": analysis,
+                        "config": config,
+                        "mission": mission,
+                        "size": size,
+                        "duration": duration,
+                        "status": status,
+                        "zip_size": zip_size,
+                    })
+                    if len(pending_backend) >= BACKEND_BATCH_SIZE:
+                        flush_backend_batch()
+
                     print(flush=True)
-                    continue
 
-                if status == "ok":
-                    mark_uploaded(root, dodge, name, zip_size, duration)
-                    move_session_to_sent(session_dir, sent_dir)
-                    sent_this_run.append((name, zip_size, duration))
-                else:
-                    failed_names.append(name)
+            flush_backend_batch()
+    except BaseException as exc:
+        if run_id:
+            finish_upload_run(run_id, "aborted", processed_count,
+                               len(sent_this_run), len(failed_names), error_msg=str(exc))
+        raise
 
-                pending_backend.append({
-                    "name": name,
-                    "analysis": analysis,
-                    "config": config,
-                    "mission": mission,
-                    "size": size,
-                    "duration": duration,
-                    "status": status,
-                    "zip_size": zip_size,
-                })
-                if len(pending_backend) >= BACKEND_BATCH_SIZE:
-                    flush_backend_batch()
-
-                print(flush=True)
-
-        flush_backend_batch()
+    if run_id:
+        finish_upload_run(run_id, "completed", processed_count,
+                           len(sent_this_run), len(failed_names))
 
     if dry_run:
         print("*** DRY-RUN terminé — rien n'a été modifié ***")
