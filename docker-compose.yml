@@ -11,7 +11,11 @@ services:
       - "2222:22"
     volumes:
       - sessions_data:/home/${SFTP_USER}/sessions
-    command: "${SFTP_USER}:${SFTP_PASS}:1000:1000:sessions"
+      # Sessions déjà traitées + envoyées à Mistral (déplacées par
+      # mission-pipeline) — exposées en lecture/écriture en SFTP elles aussi,
+      # sous un dossier séparé, pour rester consultables/récupérables côté client.
+      - sessions_envoye_data:/home/${SFTP_USER}/sessions_envoyees
+    command: "${SFTP_USER}:${SFTP_PASS}:1000:1000:sessions,sessions_envoyees"
     healthcheck:
       test: ["CMD", "pgrep", "sshd"]
       interval: 30s
@@ -63,6 +67,13 @@ services:
   #     KAFKA_BROKER: ${KAFKA_BROKER:-${VM_DATA_IP}:9092}
   #     SERVER_ID: ${SERVER_ID:-vm-storage}
   #     HEARTBEAT_INTERVAL: ${HEARTBEAT_INTERVAL:-60}
+
+  # mission-pipeline : volontairement PAS dans ce docker-compose. Le code
+  # (mission-pipeline/) reste dans le repo, mais ce service tourne désormais
+  # sur une machine séparée, qui se connecte ici en SFTP (service "sftp"
+  # ci-dessus, port 2222, IP de cette VM) pour lire SESSIONS_DIR et écrire
+  # les sessions traitées dans sessions_envoyees. Voir mission-pipeline/README
+  # ou le Dockerfile pour lancer le service côté machine distante.
 
   fs-scanner:
     platform: linux/amd64

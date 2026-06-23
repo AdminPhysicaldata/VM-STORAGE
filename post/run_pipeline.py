@@ -323,6 +323,10 @@ def main() -> int:
     )
     p.add_argument("directory", nargs="?", type=Path, help="Répertoire contenant les sessions")
     p.add_argument("--session", type=Path, help="Traiter une seule session (jamais de cache)")
+    p.add_argument("--list", type=Path, metavar="FILE",
+                   help="Traiter uniquement les sessions listées dans ce fichier "
+                        "(un chemin absolu par ligne), au lieu de tout le répertoire. "
+                        "Le cache .postcheck.json reste actif. Alternative à 'directory'.")
     p.add_argument("--apply", action="store_true",
                    help="Appliquer réellement les corrections de noms (par défaut : dry-run)")
     p.add_argument("--skip-charuco", action="store_true",
@@ -358,16 +362,29 @@ def main() -> int:
         _print_result(result, verbose=True)
         return 0
 
-    if not args.directory:
-        p.print_help()
-        return 1
+    root = None
+    if args.list:
+        list_path = args.list.resolve()
+        try:
+            lines = list_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            print(f"Impossible de lire la liste '{list_path}': {exc}")
+            return 1
+        sessions = sorted({
+            Path(l.strip()).resolve() for l in lines if l.strip()
+        })
+        sessions = [s for s in sessions if s.is_dir()]
+    else:
+        if not args.directory:
+            p.print_help()
+            return 1
+        root = args.directory.resolve()
+        sessions = sorted(
+            Path(e.path) for e in os.scandir(root) if e.is_dir(follow_symlinks=False) and e.name.startswith("session_")
+        )
 
-    root = args.directory.resolve()
-    sessions = sorted(
-        Path(e.path) for e in os.scandir(root) if e.is_dir(follow_symlinks=False) and e.name.startswith("session_")
-    )
     if not sessions:
-        print(f"Aucune session trouvée dans {root}")
+        print(f"Aucune session trouvée" + (f" dans {root}" if root else f" dans la liste '{args.list}'"))
         return 0
 
     if args.move_clean:
