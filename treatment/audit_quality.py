@@ -7,11 +7,15 @@ Lance tous les checks de checks.py sur un répertoire de sessions SANS
 rapport trié par score croissant pour repérer les sessions les plus
 problématiques, et un CSV optionnel pour analyse externe.
 
+Le traitement d'une session est CPU-bound (numpy, flux optique OpenCV) :
+les sessions sont réparties sur plusieurs processus (multiprocessing,
+contourne le GIL) pour paralléliser sur tous les cœurs disponibles.
+
 Usage :
   python audit_quality.py --dir /data/sessions
   python audit_quality.py --dir /data/sessions --pattern "session_2026*"
   python audit_quality.py --dir /data/sessions --csv audit.csv
-  python audit_quality.py --dir /data/sessions --max-grade C   # n'affiche que score <= grade C
+  python audit_quality.py --dir /data/sessions --workers 16
 """
 from __future__ import annotations
 
@@ -20,9 +24,11 @@ import csv
 import fnmatch
 import json
 import logging
+import multiprocessing
 import os
 import sys
 import time
+from concurrent.futures import ProcessPoolExecutor, as_completed
 from pathlib import Path
 from typing import Optional
 
@@ -93,6 +99,13 @@ def find_sessions(search_dir: str, pattern: str = None) -> list[str]:
     return out
 
 
+def _init_worker():
+    """Limite chaque worker à 1 thread OpenCV interne pour éviter la
+    sur-souscription CPU (N processus x M threads OpenCV chacun)."""
+    if checks.HAS_CV2:
+        checks.cv2.setNumThreads(1)
+
+
 def audit_session(session_path: str) -> dict:
     """Lance les checks et retourne une ligne de rapport. N'écrit jamais sur disque."""
     session_path = str(Path(session_path).resolve())
@@ -140,6 +153,10 @@ def main():
     parser.add_argument("--session", "-s", default=None, help="Auditer une seule session")
     parser.add_argument("--csv", default=None, help="Chemin du CSV de sortie (optionnel)")
     parser.add_argument("--top", type=int, default=20, help="Nombre de pires sessions à afficher (def: 20)")
+    parser.add_argument(
+        "--workers", "-w", type=int, default=0,
+        help="Nombre de processus parallèles (def: tous les cœurs CPU). 1 = séquentiel",
+    )
     args = parser.parse_args()
 
     if args.session:
@@ -151,13 +168,28 @@ def main():
         logger.warning("Aucune session trouvée dans %s (pattern=%s)", args.dir, args.pattern)
         sys.exit(0)
 
-    logger.info("%d session(s) à auditer", len(session_dirs))
+    n_workers = args.workers if args.workers > 0 else multiprocessing.cpu_count()
+    n_workers = max(1, min(n_workers, len(session_dirs)))
+    logger.info("%d session(s) à auditer avec %d worker(s)", len(session_dirs), n_workers)
 
     rows = []
     t_start = time.monotonic()
-    for i, sd in enumerate(session_dirs, 1):
-        logger.info("[%d/%d] %s", i, len(session_dirs), os.path.basename(sd))
-        rows.append(audit_session(sd))
+    done = 0
+
+    if n_workers == 1:
+        for sd in session_dirs:
+            done += 1
+            logger.info("[%d/%d] %s", done, len(session_dirs), os.path.basename(sd))
+            rows.append(audit_session(sd))
+    else:
+        with ProcessPoolExecutor(max_workers=n_workers, initializer=_init_worker) as pool:
+            futures = {pool.submit(audit_session, sd): sd for sd in session_dirs}
+            for future in as_completed(futures):
+                done += 1
+                row = future.result()
+                logger.info("[%d/%d] %s → score=%.1f", done, len(session_dirs),
+                            row["session_id"], row["score"])
+                rows.append(row)
 
     elapsed = time.monotonic() - t_start
     rows.sort(key=lambda r: r["score"])
