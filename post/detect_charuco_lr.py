@@ -166,7 +166,7 @@ def _classify(ratio: float | None) -> str:
 
 
 def expected_role(name: str) -> str:
-    return "head" if name == "head" else "gripper"
+    return "head" if name in ("head", "wall") else "gripper"  # "wall" : alias toléré de "head"
 
 
 # ─── Analyse d'une session ───────────────────────────────────────────────────
@@ -246,8 +246,8 @@ def apply_fix(session_dir: Path, findings: list[VideoFinding]) -> None:
     On échange juste leurs deux noms — sans jamais essayer de deviner si le
     gripper en question est "vraiment" left ou right."""
     mismatched = [f for f in findings if f.mismatch]
-    head_wrong = [f for f in mismatched if f.current_name == "head" and f.role == "gripper"]
-    other_wrong = [f for f in mismatched if f.current_name != "head" and f.role == "head"]
+    head_wrong = [f for f in mismatched if f.current_name in ("head", "wall") and f.role == "gripper"]
+    other_wrong = [f for f in mismatched if f.current_name not in ("head", "wall") and f.role == "head"]
 
     if len(mismatched) != 2 or len(head_wrong) != 1 or len(other_wrong) != 1:
         print(f"  pas de correction automatique sûre ({len(mismatched)} vidéo(s) incohérente(s)) "

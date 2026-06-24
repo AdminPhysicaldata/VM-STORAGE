@@ -9,7 +9,8 @@ RUN apt-get update \
 
 # opencv-contrib-python-headless : pas de matplotlib volontairement, --plot
 # n'est utilisé qu'en debug manuel, jamais dans la boucle automatique.
-RUN pip install --no-cache-dir opencv-contrib-python-headless numpy
+# pandas : requis par checks.py (scoring qualité fusionné depuis treatment-worker).
+RUN pip install --no-cache-dir opencv-contrib-python-headless numpy pandas
 
 WORKDIR /app
 COPY post/*.py .

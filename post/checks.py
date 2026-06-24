@@ -118,11 +118,14 @@ def _cameras_dir(session_path: str):
 
 
 def _find_video_file(directory: str, cam_name: str):
-    """Cherche un fichier vidéo pour la caméra donnée dans le répertoire."""
-    for ext in (".mp4", ".avi", ".mkv", ".mov", ".h264"):
-        p = os.path.join(directory, f"{cam_name}{ext}")
-        if os.path.isfile(p):
-            return p
+    """Cherche un fichier vidéo pour la caméra donnée dans le répertoire.
+    Tolère "wall" comme nom alternatif de la caméra fixe "head"."""
+    candidates = ("head", "wall") if cam_name == "head" else (cam_name,)
+    for cand in candidates:
+        for ext in (".mp4", ".avi", ".mkv", ".mov", ".h264"):
+            p = os.path.join(directory, f"{cand}{ext}")
+            if os.path.isfile(p):
+                return p
     return None
 
 
@@ -692,8 +695,12 @@ def _check_gripper_label_inversion(session_path):
     if not left_video and not right_video:
         return _skip("Vidéos left et right toutes les deux manquantes")
 
-    # Charger les timestamps depuis les JSONL
-    head_ts  = _load_frame_timestamps(os.path.join(cam_dir, "head.jsonl"))  if os.path.isfile(os.path.join(cam_dir, "head.jsonl"))  else []
+    # Charger les timestamps depuis les JSONL ("wall" toléré comme alias de "head")
+    head_jsonl = next(
+        (os.path.join(cam_dir, f"{n}.jsonl") for n in ("head", "wall")
+         if os.path.isfile(os.path.join(cam_dir, f"{n}.jsonl"))), None,
+    )
+    head_ts  = _load_frame_timestamps(head_jsonl) if head_jsonl else []
     left_ts  = _load_frame_timestamps(os.path.join(cam_dir, "left.jsonl"))  if os.path.isfile(os.path.join(cam_dir, "left.jsonl"))  else []
     right_ts = _load_frame_timestamps(os.path.join(cam_dir, "right.jsonl")) if os.path.isfile(os.path.join(cam_dir, "right.jsonl")) else []
 

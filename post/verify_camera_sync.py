@@ -97,10 +97,12 @@ def check_session(session_dir: Path) -> list[SyncIssue]:
     if not resampled_path.is_file():
         return []  # pas de grille resample → rien à vérifier
 
+    # "wall" est un nom alternatif toléré pour la caméra fixe "head".
     raw_ts: dict[str, np.ndarray] = {}
     for cam in ("left", "right", "head"):
-        p = cam_dir / f"{cam}.jsonl"
-        if p.is_file():
+        names = (cam, "wall") if cam == "head" else (cam,)
+        p = next((cam_dir / f"{n}.jsonl" for n in names if (cam_dir / f"{n}.jsonl").is_file()), None)
+        if p is not None:
             raw_ts[cam] = _load_raw_timestamps(p)
 
     bad_ts = {cam: 0 for cam in raw_ts}
@@ -117,7 +119,7 @@ def check_session(session_dir: Path) -> list[SyncIssue]:
                 d = json.loads(line)
                 frames = d.get("frames", {})
                 for key, info in frames.items():
-                    cam_key = "right" if key == "rigth" else key
+                    cam_key = "right" if key == "rigth" else ("head" if key == "wall" else key)
                     if cam_key not in raw_ts:
                         continue
                     total[cam_key] += 1

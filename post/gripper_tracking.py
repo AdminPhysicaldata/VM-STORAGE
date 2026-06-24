@@ -242,19 +242,22 @@ def _imu_at(orient: Optional[dict], ts_ms: float) -> Tuple[float, float, float]:
 # ═════════════════════════════════════════════════════════════════════════════
 
 def _load_calibration(session_path: str, cam_name: str):
-    for pattern in _CALIB_PATTERNS:
-        path = pattern.format(session=session_path, cam=cam_name)
-        if not os.path.isfile(path):
-            continue
-        try:
-            data = np.load(path)
-            keys = set(data.files)
-            cam_key  = next((k for k in ("camera_matrix", "K", "mtx") if k in keys), None)
-            dist_key = next((k for k in ("dist_coeffs",   "dist", "D") if k in keys), None)
-            if cam_key and dist_key:
-                return data[cam_key].astype(np.float64), data[dist_key].astype(np.float64), True
-        except Exception as e:
-            logger.debug("Erreur calib %s : %s", path, e)
+    # "wall" est un nom alternatif toléré pour la caméra fixe "head".
+    candidates = ("head", "wall") if cam_name == "head" else (cam_name,)
+    for cand in candidates:
+        for pattern in _CALIB_PATTERNS:
+            path = pattern.format(session=session_path, cam=cand)
+            if not os.path.isfile(path):
+                continue
+            try:
+                data = np.load(path)
+                keys = set(data.files)
+                cam_key  = next((k for k in ("camera_matrix", "K", "mtx") if k in keys), None)
+                dist_key = next((k for k in ("dist_coeffs",   "dist", "D") if k in keys), None)
+                if cam_key and dist_key:
+                    return data[cam_key].astype(np.float64), data[dist_key].astype(np.float64), True
+            except Exception as e:
+                logger.debug("Erreur calib %s : %s", path, e)
     return None, None, False
 
 
@@ -779,15 +782,23 @@ def _read_timestamps(jsonl_path: str) -> List[float]:
 
 
 def _find_files(cam_dir: str, cam_name: str):
-    """Retourne (video_path | None, jsonl_path | None) dans cam_dir."""
-    jsonl = os.path.join(cam_dir, f"{cam_name}.jsonl")
-    if not os.path.isfile(jsonl):
-        jsonl = None
-    video = None
-    for ext in _VIDEO_EXTS:
-        p = os.path.join(cam_dir, f"{cam_name}{ext}")
+    """Retourne (video_path | None, jsonl_path | None) dans cam_dir.
+    Tolère "wall" comme nom alternatif de la caméra fixe "head"."""
+    candidates = ("head", "wall") if cam_name == "head" else (cam_name,)
+    jsonl = None
+    for cand in candidates:
+        p = os.path.join(cam_dir, f"{cand}.jsonl")
         if os.path.isfile(p):
-            video = p
+            jsonl = p
+            break
+    video = None
+    for cand in candidates:
+        for ext in _VIDEO_EXTS:
+            p = os.path.join(cam_dir, f"{cand}{ext}")
+            if os.path.isfile(p):
+                video = p
+                break
+        if video:
             break
     return video, jsonl
 

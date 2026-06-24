@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Pipeline complet de nettoyage/validation d'un répertoire de sessions.
+"""Pipeline complet de nettoyage/validation/notation d'un répertoire de sessions.
 
 Chaîne, pour chaque session, les contrôles dans cet ordre :
 
@@ -35,32 +35,53 @@ Chaîne, pour chaque session, les contrôles dans cet ordre :
                            rend la session anormale (corrigé auto en --apply) ;
                            "inconclusive" même après le scan complet reste OK :
                            l'absence de preuve n'est pas une preuve d'inversion.
+  7. checks.py (score)  — note la session de 0 à 100 (grade A-F), 8 critères
+                           pondérés (sync caméras, stabilité vidéo, détection
+                           gripper, IMU, intégrité, couverture temporelle,
+                           durée). Fusionné depuis treatment-worker : même
+                           moteur de scoring que le pipeline de production,
+                           pour avoir une note cohérente entre l'audit local
+                           et le traitement en base. N'écrit rien d'autre que
+                           le marqueur de cache (.postcheck.json) — jamais de
+                           treatment.json dans la session (réservé au worker).
+  8. structure (mistral) — vérification légère façon SessionsToMistral.py
+                           (result.json=SUCCESS, tailles mp4, fichiers
+                           capteurs...) : ce qui ferait rejeter la session à
+                           l'envoi, détecté ici en amont plutôt qu'au moment
+                           de l'upload.
 
 Conçu pour tourner sur des dizaines de milliers de sessions :
 
-  - Parallélisme par PROCESSUS (pas threads) : le décodage vidéo (charuco)
-    est CPU-bound, un ProcessPoolExecutor exploite donc tous les cœurs sans
-    être bridé par le GIL. Réglable via -j/--workers (défaut : tous les cœurs).
+  - Parallélisme par PROCESSUS (pas threads) : le décodage vidéo (charuco,
+    scoring) est CPU-bound, un ProcessPoolExecutor exploite donc tous les
+    cœurs sans être bridé par le GIL. Réglable via -j/--workers (défaut :
+    tous les cœurs). Chaque worker limite OpenCV à 1 thread interne pour
+    éviter la sur-souscription CPU (N processus x M threads chacun).
   - Cache persistant par session : un fichier .postcheck.json est écrit dans
-    chaque session après son premier passage. Au prochain run, si aucun
-    fichier de la session n'a changé (empreinte taille+mtime) ET que les
-    paramètres du pipeline sont identiques, la session est court-circuitée
-    sans rien redécoder. Sur un dossier de sessions qui grossit en continu
-    (le cas réel ici), ça transforme un "tout réanalyser chaque nuit" en
-    "n'analyser que les sessions réellement nouvelles". --force ignore le cache.
+    chaque session après son premier passage (statut structurel + score de
+    qualité + lignes de détail). Au prochain run, si aucun fichier de la
+    session n'a changé (empreinte taille+mtime) ET que les paramètres du
+    pipeline sont identiques, la session est court-circuitée sans rien
+    redécoder. Sur un dossier de sessions qui grossit en continu (le cas réel
+    ici), ça transforme un "tout réanalyser chaque nuit" en "n'analyser que
+    les sessions réellement nouvelles". --force ignore le cache.
+  - Tableau de bord ASCII en direct (curses) : score moyen, distribution des
+    grades A-F, moyennes par critère, problèmes les plus fréquents. Touche
+    'q' pour arrêter proprement. Retombe automatiquement en lignes de
+    progression texte simple si la sortie n'est pas un vrai terminal (cron,
+    Docker, --report, --no-ui) — jamais de plantage curses en conteneur.
   - Isolation des erreurs : une session qui plante (vidéo illisible,
     exception inattendue) est rapportée en erreur et n'interrompt jamais le
     reste du lot.
   - Rapport JSONL optionnel (--report) pour audit/diff sans avoir à tout
-    réimprimer sur stdout, et progression périodique au lieu d'un print par
-    session.
+    réimprimer sur stdout.
 
 Usage :
-    # Rapport complet, aucune modification, tous les cœurs
+    # Rapport complet, aucune modification, tableau de bord ASCII, tous les cœurs
     python3 run_pipeline.py /media/qbee/T9/sessions/
 
-    # Gros volume : limiter les workers, écrire un rapport JSONL
-    python3 run_pipeline.py /media/qbee/T9/sessions/ -j 12 --report report.jsonl
+    # Gros volume : limiter les workers, écrire un rapport JSONL, mode texte (cron)
+    python3 run_pipeline.py /media/qbee/T9/sessions/ -j 12 --report report.jsonl --no-ui
 
     # Une seule session, verbeux, jamais de cache
     python3 run_pipeline.py --session ../session_20260605_190710
@@ -68,32 +89,192 @@ Usage :
     # Application réelle + tri, en ignorant le cache existant
     python3 run_pipeline.py /media/qbee/T9/sessions/ --apply --force \\
         --move-clean /media/qbee/T9/clean/ --move-bad /media/qbee/T9/quarantine/
+
+    # Sauter le scoring qualité (post/ seul, comportement historique)
+    python3 run_pipeline.py /media/qbee/T9/sessions/ --skip-quality
 """
 from __future__ import annotations
 
 import argparse
 import json
 import os
+import re
 import shutil
 import sys
+import threading
 import time
+from collections import Counter
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from hashlib import sha1
 from pathlib import Path
+from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+os.environ.setdefault("NAS_SESSIONS_DIR", "")
 
 import fix_camera_names
 import verify_camera_sync
 import verify_integrity
 import diagnose_shuffle
+import checks  # noqa: E402 — scoring qualité (ex treatment-worker)
 
-_PIPELINE_VERSION = 7  # bump à chaque changement de sémantique pour invalider le cache existant
+_PIPELINE_VERSION = 8  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
 _DEFAULT_WORKERS = os.cpu_count() or 4
 _PROGRESS_EVERY = 200
+
+GRADES = ("A", "B", "C", "D", "F")
+
+
+# ─── Couche structure (façon SessionsToMistral.py) ───────────────────────────
+# Copié localement (logique pure, sans réseau) pour ne pas dépendre de
+# `requests` ni des constantes d'upload du module original.
+
+_MP4_MIN_BYTES = 100_000  # 100 KB
+
+
+def validate_mistral_structure(session_dir: Path) -> list[str]:
+    issues: list[str] = []
+
+    result_path = session_dir / "result.json"
+    if not result_path.exists():
+        issues.append("result.json manquant")
+    else:
+        try:
+            res = json.loads(result_path.read_text(encoding="utf-8"))
+            if str(res.get("result", "")).upper() != "SUCCESS":
+                issues.append(f"result.json non-SUCCESS (valeur : '{res.get('result')}')")
+        except Exception as exc:
+            issues.append(f"result.json illisible : {exc}")
+
+    config_path = session_dir / "config.json"
+    expected_cameras: list[str] = []
+    expected_sensors: list[str] = []
+    if not config_path.exists():
+        issues.append("config.json manquant")
+    else:
+        try:
+            cfg = json.loads(config_path.read_text(encoding="utf-8"))
+            for cam in cfg.get("cameras", []):
+                name = cam.get("name")
+                if not name:
+                    continue
+                expected_cameras.append(name)
+                if cam.get("error"):
+                    issues.append(f"caméra '{name}' : erreur hardware ({cam['error']})")
+            for sen in cfg.get("sensors", []):
+                if sen.get("name"):
+                    expected_sensors.append(sen["name"])
+        except Exception as exc:
+            issues.append(f"config.json illisible : {exc}")
+
+    if not (session_dir / "mission.json").exists():
+        issues.append("mission.json manquant")
+
+    analysis_path = session_dir / "analysis.json"
+    if analysis_path.exists():
+        try:
+            data = json.loads(analysis_path.read_text(encoding="utf-8"))
+            sync = data.get("sync_check", {})
+            if isinstance(sync.get("ok"), bool) and not sync["ok"]:
+                issues.append(f"sync_check échoué — delta={sync.get('delta_sec', '?')}s")
+            for e in data.get("errors") or []:
+                issues.append(f"analysis.json erreur : {e}")
+        except Exception:
+            pass
+
+    cam_dir = session_dir / "cameras"
+    for name in expected_cameras:
+        mp4 = cam_dir / f"{name}.mp4"
+        jsonl = cam_dir / f"{name}.jsonl"
+        if not mp4.exists():
+            issues.append(f"cameras/{name}.mp4 manquant")
+        elif mp4.stat().st_size < _MP4_MIN_BYTES:
+            issues.append(f"cameras/{name}.mp4 trop petit ({mp4.stat().st_size} octets)")
+        if not jsonl.exists():
+            issues.append(f"cameras/{name}.jsonl manquant")
+        elif jsonl.stat().st_size == 0:
+            issues.append(f"cameras/{name}.jsonl vide")
+
+    resampled = cam_dir / "resampled_30hz.jsonl"
+    if expected_cameras:
+        if not resampled.exists():
+            issues.append("cameras/resampled_30hz.jsonl manquant")
+        elif resampled.stat().st_size == 0:
+            issues.append("cameras/resampled_30hz.jsonl vide")
+
+    sen_dir = session_dir / "sensors"
+    for name in expected_sensors:
+        jsonl = sen_dir / f"{name}.jsonl"
+        if not jsonl.exists():
+            issues.append(f"sensors/{name}.jsonl manquant")
+        elif jsonl.stat().st_size == 0:
+            issues.append(f"sensors/{name}.jsonl vide")
+
+    return issues
+
+
+# ─── Couche scoring qualité (checks.py, ex treatment-worker) ─────────────────
+
+def _read_json_safe(path: str) -> dict:
+    try:
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _get_duration(session_path: str) -> Optional[float]:
+    analysis = _read_json_safe(os.path.join(session_path, "analysis.json"))
+    if analysis:
+        cams = analysis.get("fps_check", {}).get("cameras", {})
+        durs = [c["duration_sec"] for c in cams.values() if c.get("duration_sec")]
+        if durs:
+            durs.sort()
+            return durs[len(durs) // 2]
+    for fname in ("metadata.json", "config.json"):
+        meta = _read_json_safe(os.path.join(session_path, fname))
+        if isinstance(meta.get("duration_seconds"), (int, float)):
+            return float(meta["duration_seconds"])
+    return None
+
+
+def _get_scenario(session_path: str) -> Optional[str]:
+    mission = _read_json_safe(os.path.join(session_path, "mission.json"))
+    if mission.get("scenario_id"):
+        return str(mission["scenario_id"])
+    if mission.get("name"):
+        return str(mission["name"])
+    meta = _read_json_safe(os.path.join(session_path, "metadata.json"))
+    sid = meta.get("scenario_id") or meta.get("scenario")
+    return str(sid) if sid else None
+
+
+def build_quality_session_dict(session_path: str) -> dict:
+    session_id = os.path.basename(session_path.rstrip("/"))
+    return {
+        "session_id":       session_id,
+        "session_folder":   session_path,
+        "duration_seconds": _get_duration(session_path),
+        "scenario_id":      _get_scenario(session_path),
+    }
+
+
+def compute_quality(session_dir: Path) -> tuple[float, str, dict, list[str]]:
+    """Retourne (score, grade, criteria, lines) via checks.run_checks()."""
+    session_path = str(session_dir)
+    session = build_quality_session_dict(session_path)
+    result = checks.run_checks(session, session_path_override=session_path)
+    quality = result.get("quality", {})
+    score, grade = quality.get("score", 0.0), quality.get("grade", "F")
+    criteria = quality.get("criteria", {})
+    lines = [
+        f"[score] {k}: {v.get('detail', '')}"
+        for k, v in result["checks"].items() if not v.get("ok", True)
+    ]
+    return score, grade, criteria, lines
 
 
 # ─── Empreinte de session (pour le cache) ────────────────────────────────────
@@ -123,11 +304,11 @@ def _fingerprint(session_dir: Path) -> str:
 
 
 def _config_key(apply: bool, run_charuco: bool, charuco_sample_fps: float,
-                 run_lr_check: bool, lr_n_samples: int) -> str:
+                 run_lr_check: bool, lr_n_samples: int, run_quality: bool) -> str:
     # NB : "apply" n'entre pas dans la clé — un résultat "OK" en dry-run reste
     # valide en mode --apply (rien à appliquer). Voir _process_one pour la
     # logique d'invalidation qui dépend du statut ET de apply.
-    return f"{_PIPELINE_VERSION}:{run_charuco}:{charuco_sample_fps}:{run_lr_check}:{lr_n_samples}"
+    return f"{_PIPELINE_VERSION}:{run_charuco}:{charuco_sample_fps}:{run_lr_check}:{lr_n_samples}:{run_quality}"
 
 
 def _load_cache(session_dir: Path, fingerprint: str, config_key: str) -> dict | None:
@@ -140,7 +321,9 @@ def _load_cache(session_dir: Path, fingerprint: str, config_key: str) -> dict | 
     return data
 
 
-def _save_cache(session_dir: Path, fingerprint: str, config_key: str, status: str, lines: list[str]) -> None:
+def _save_cache(session_dir: Path, fingerprint: str, config_key: str, status: str,
+                 lines: list[str], score: float, grade: str, criteria: dict,
+                 mistral_issues: list[str]) -> None:
     marker = session_dir / _MARKER_NAME
     try:
         marker.write_text(json.dumps({
@@ -148,6 +331,10 @@ def _save_cache(session_dir: Path, fingerprint: str, config_key: str, status: st
             "config_key": config_key,
             "status": status,
             "lines": lines,
+            "score": score,
+            "grade": grade,
+            "criteria": criteria,
+            "mistral_issues": mistral_issues,
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }), encoding="utf-8")
     except OSError:
@@ -155,6 +342,13 @@ def _save_cache(session_dir: Path, fingerprint: str, config_key: str, status: st
 
 
 # ─── Traitement d'une session (fonction top-level → picklable pour le pool) ──
+
+def _init_worker() -> None:
+    """Limite chaque worker à 1 thread OpenCV interne pour éviter la
+    sur-souscription CPU (N processus x M threads OpenCV chacun)."""
+    if checks.HAS_CV2:
+        checks.cv2.setNumThreads(1)
+
 
 def _process_one(
     session_dir_str: str,
@@ -164,13 +358,14 @@ def _process_one(
     force: bool,
     run_lr_check: bool = True,
     lr_n_samples: int = 10,
+    run_quality: bool = True,
 ) -> dict:
     """Tout ce qui touche une session, isolé pour tourner dans un worker
     séparé. Ne lève jamais — toute exception est convertie en statut ERROR
     pour ne jamais faire tomber le pool sur une session pourrie."""
     session_dir = Path(session_dir_str)
     name = session_dir.name
-    config_key = _config_key(apply, run_charuco, charuco_sample_fps, run_lr_check, lr_n_samples)
+    config_key = _config_key(apply, run_charuco, charuco_sample_fps, run_lr_check, lr_n_samples, run_quality)
 
     try:
         fingerprint = _fingerprint(session_dir)
@@ -180,7 +375,11 @@ def _process_one(
         # si apply=True il faut réellement tenter la correction, pas juste relire
         # un ancien diagnostic jamais appliqué.
         if cached is not None and (cached["status"] == "OK" or not apply):
-            return {"name": name, "status": cached["status"], "lines": cached["lines"], "cached": True}
+            return {
+                "name": name, "status": cached["status"], "lines": cached["lines"], "cached": True,
+                "score": cached.get("score", 0.0), "grade": cached.get("grade", "F"),
+                "criteria": cached.get("criteria", {}), "mistral_issues": cached.get("mistral_issues", []),
+            }
 
         lines: list[str] = []
 
@@ -298,23 +497,403 @@ def _process_one(
                     lines.append(f"{tag} {verdict} (non bloquant)")
                 is_clean = is_clean and verdict != "swap"
 
+        # Score de qualité 0-100 / grade A-F (checks.py) — n'influence PAS
+        # is_clean/status : c'est une dimension indépendante de la conformité
+        # structurelle, affichée et cachée à part (cf. docstring point 7).
+        score, grade, criteria = 0.0, "F", {}
+        if run_quality:
+            try:
+                score, grade, criteria, q_lines = compute_quality(session_dir)
+                lines.extend(q_lines)
+            except Exception as e:
+                lines.append(f"[score/erreur] {e!r}")
+
+        mistral_issues = validate_mistral_structure(session_dir)
+        for issue in mistral_issues:
+            lines.append(f"[structure] {issue}")
+
         status = "OK" if is_clean else "ANOMALY"
-        _save_cache(session_dir, fingerprint, config_key, status, lines)
-        return {"name": name, "status": status, "lines": lines, "cached": False}
+        _save_cache(session_dir, fingerprint, config_key, status, lines, score, grade, criteria, mistral_issues)
+        return {
+            "name": name, "status": status, "lines": lines, "cached": False,
+            "score": score, "grade": grade, "criteria": criteria, "mistral_issues": mistral_issues,
+        }
 
     except Exception as exc:  # noqa: BLE001 — défense en profondeur, jamais de crash du pool
-        return {"name": name, "status": "ERROR", "lines": [f"[erreur interne] {exc!r}"], "cached": False}
+        return {
+            "name": name, "status": "ERROR", "lines": [f"[erreur interne] {exc!r}"], "cached": False,
+            "score": 0.0, "grade": "F", "criteria": {}, "mistral_issues": [],
+        }
 
 
-# ─── Affichage / rapport ─────────────────────────────────────────────────────
+# ─── Statistiques agrégées en direct ──────────────────────────────────────────
+
+_TAG_RE = re.compile(r"^\[([^\]]+)\]")
+
+
+def _extract_tags(lines: list[str]) -> list[str]:
+    tags = []
+    for line in lines:
+        m = _TAG_RE.match(line.strip())
+        tags.append(m.group(1) if m else "autre")
+    return tags
+
+
+class Stats:
+    def __init__(self):
+        self.done = 0
+        self.grade_counts: Counter = Counter()
+        self.score_sum = 0.0
+        self.criteria_sum: Counter = Counter()
+        self.criteria_count: Counter = Counter()
+        self.issue_counts: Counter = Counter()
+        self.status_counts: Counter = Counter()
+        self.n_mistral_issue = 0
+
+    def add(self, row: dict) -> None:
+        self.done += 1
+        self.grade_counts[row.get("grade", "F")] += 1
+        self.score_sum += row.get("score", 0.0) or 0.0
+        self.status_counts[row.get("status", "ERROR")] += 1
+
+        for k, v in (row.get("criteria") or {}).items():
+            sc = v.get("score", 0.0) if isinstance(v, dict) else v
+            self.criteria_sum[k] += sc
+            self.criteria_count[k] += 1
+
+        for tag in _extract_tags(row.get("lines") or []):
+            self.issue_counts[tag] += 1
+
+        if row.get("mistral_issues"):
+            self.n_mistral_issue += 1
+
+    def avg_score(self) -> float:
+        return self.score_sum / self.done if self.done else 0.0
+
+    def criteria_averages(self) -> dict:
+        return {k: self.criteria_sum[k] / self.criteria_count[k]
+                for k in self.criteria_sum if self.criteria_count[k]}
+
+    def top_issues(self, n: int = 10) -> list:
+        return self.issue_counts.most_common(n)
+
+
+# ─── Affichage — tableau de bord ASCII (curses) ou texte simple en fallback ──
+
+def _render_dashboard(stdscr, stats: Stats, total: int, t_start: float, label: str) -> None:
+    import curses
+
+    stdscr.erase()
+    maxy, maxx = stdscr.getmaxyx()
+
+    def put(y: int, x: int, text: str, attr: int = 0) -> None:
+        if 0 <= y < maxy - 1 and 0 <= x < maxx:
+            try:
+                stdscr.addstr(y, x, text[: max(0, maxx - x - 1)], attr)
+            except curses.error:
+                pass
+
+    elapsed = time.monotonic() - t_start
+    rate = stats.done / elapsed if elapsed > 0 else 0.0
+    eta_min = (total - stats.done) / rate / 60.0 if rate > 0 else 0.0
+    pct = stats.done / total * 100 if total else 0.0
+
+    put(0, 0, f" POST PIPELINE — {label} ".center(maxx - 1, "─"), curses.A_BOLD)
+    put(1, 1, f"{stats.done}/{total} ({pct:5.1f}%)  |  {rate:5.2f} sess/s  |  "
+              f"ETA {eta_min:6.0f} min  |  [q] arrêter proprement")
+
+    bar_w = max(10, maxx - 4)
+    filled = int(bar_w * pct / 100)
+    put(2, 1, "[" + "#" * filled + "-" * (bar_w - filled) + "]")
+
+    put(4, 1, f"Score moyen global : {stats.avg_score():5.1f} / 100"
+              f"   |   OK={stats.status_counts.get('OK', 0)}  "
+              f"ANOMALY={stats.status_counts.get('ANOMALY', 0)}  "
+              f"ERROR={stats.status_counts.get('ERROR', 0)}", curses.A_BOLD)
+
+    row = 6
+    put(row, 1, "Distribution des grades :", curses.A_UNDERLINE)
+    row += 1
+    bw = 30
+    for g in GRADES:
+        n = stats.grade_counts.get(g, 0)
+        pctg = n / stats.done * 100 if stats.done else 0.0
+        f = int(bw * pctg / 100)
+        put(row, 3, f"{g}  [{'#' * f}{'-' * (bw - f)}]  {pctg:5.1f}%  ({n})")
+        row += 1
+
+    row += 1
+    put(row, 1, "Moyennes par critère (checks.py) :", curses.A_UNDERLINE)
+    row += 1
+    items = sorted(stats.criteria_averages().items())
+    for i in range(0, len(items), 2):
+        line = ""
+        for k, v in items[i:i + 2]:
+            line += f"{k:<24} {v:5.1f}   "
+        put(row, 3, line)
+        row += 1
+
+    row += 1
+    put(row, 1, "Problèmes les plus fréquents :", curses.A_UNDERLINE)
+    row += 1
+    top = stats.top_issues(10)
+    if not top:
+        put(row, 3, "(aucun pour le moment)")
+        row += 1
+    for i in range(0, len(top), 2):
+        line = ""
+        for name, cnt in top[i:i + 2]:
+            line += f"{name[:28]:<28} {cnt:>5}   "
+        put(row, 3, line)
+        row += 1
+
+    row += 1
+    put(row, 1, f"Problèmes de structure (style SessionsToMistral) : {stats.n_mistral_issue}", curses.A_BOLD)
+
+    stdscr.refresh()
+
+
+def _print_live_plain(stats: Stats, total: int, t_start: float) -> None:
+    elapsed = time.monotonic() - t_start
+    rate = stats.done / elapsed if elapsed > 0 else 0.0
+    eta_min = (total - stats.done) / rate / 60.0 if rate > 0 else 0.0
+    grade_pct = " ".join(
+        f"{g}={stats.grade_counts.get(g, 0) / stats.done * 100:.0f}%" for g in GRADES
+    ) if stats.done else ""
+    print(
+        f"  … {stats.done}/{total}  {grade_pct}  ok={stats.status_counts.get('OK', 0)} "
+        f"anomalies={stats.status_counts.get('ANOMALY', 0)} erreurs={stats.status_counts.get('ERROR', 0)}  "
+        f"({rate:.1f} sessions/s, ETA {eta_min:.1f} min)",
+        end="\r", flush=True,
+    )
+
+
+class Reporter:
+    """Affiche la progression soit via curses (tableau de bord ASCII), soit
+    en texte simple (\\r) si curses est indisponible/désactivé. Débit limité
+    à min_interval secondes pour ne pas ralentir le run sur de petites
+    sessions très rapides."""
+
+    def __init__(self, stdscr, label: str, total: int, t_start: float, min_interval: float = 0.4):
+        self.stdscr = stdscr
+        self.label = label
+        self.total = total
+        self.t_start = t_start
+        self.min_interval = min_interval
+        self._last_draw = 0.0
+        if self.stdscr is not None:
+            self.stdscr.nodelay(True)
+
+    def update(self, stats: Stats, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and now - self._last_draw < self.min_interval:
+            return
+        self._last_draw = now
+        if self.stdscr is not None:
+            _render_dashboard(self.stdscr, stats, self.total, self.t_start, self.label)
+        else:
+            _print_live_plain(stats, self.total, self.t_start)
+
+    def quit_requested(self) -> bool:
+        if self.stdscr is None:
+            return False
+        import curses
+        try:
+            ch = self.stdscr.getch()
+        except curses.error:
+            return False
+        return ch in (ord("q"), ord("Q"))
+
+
+# ─── Affichage par session (mode texte uniquement) ───────────────────────────
 
 def _print_result(result: dict, verbose: bool) -> None:
     if result["lines"] or verbose:
         cache_tag = " [cache]" if result.get("cached") else ""
-        print(f"\n{result['name']}  [{result['status']}]{cache_tag}")
+        print(f"\n{result['name']}  [{result['status']}] score={result.get('score', 0.0):.1f} "
+              f"grade={result.get('grade', '?')}{cache_tag}")
         for line in result["lines"]:
             print(f"  {line}")
 
+
+# ─── Cœur du traitement (appelé directement, ou via curses.wrapper) ─────────
+
+def _run(stdscr, args) -> tuple[dict, int, dict]:
+    run_charuco = not args.skip_charuco
+    run_lr_check = not args.skip_lr_check
+    run_quality = not args.skip_quality
+    checks.ENABLE_VISION = not args.skip_quality_vision  # cf. checks.py — gripper_tracking/label_inversion
+
+    # ── Mode session unique : pas de tableau de bord, juste le résultat ──────
+    if args.session:
+        session_dir = args.session.resolve()
+        result = _process_one(
+            str(session_dir), args.apply, run_charuco, args.charuco_sample_fps, force=True,
+            run_lr_check=run_lr_check, lr_n_samples=args.lr_n_samples, run_quality=run_quality,
+        )
+        _print_result(result, verbose=True)
+        return {}, (0 if result["status"] != "ERROR" else 1), {"single": True}
+
+    root = None
+    if args.list:
+        list_path = args.list.resolve()
+        try:
+            lines = list_path.read_text(encoding="utf-8").splitlines()
+        except OSError as exc:
+            print(f"Impossible de lire la liste '{list_path}': {exc}")
+            return {}, 1, {"single": False, "total": 0}
+        sessions = sorted({Path(l.strip()).resolve() for l in lines if l.strip()})
+        sessions = [s for s in sessions if s.is_dir()]
+    else:
+        if not args.directory:
+            return {}, 1, {"single": False, "total": 0, "no_args": True}
+        root = args.directory.resolve()
+        sessions = sorted(
+            Path(e.path) for e in os.scandir(root) if e.is_dir(follow_symlinks=False) and e.name.startswith("session_")
+        )
+
+    if not sessions:
+        print(f"Aucune session trouvée" + (f" dans {root}" if root else f" dans la liste '{args.list}'"))
+        return {}, 0, {"single": False, "total": 0}
+
+    if args.move_clean:
+        args.move_clean.mkdir(parents=True, exist_ok=True)
+    if args.move_bad:
+        args.move_bad.mkdir(parents=True, exist_ok=True)
+
+    total = len(sessions)
+    label = root.name if root else (args.list.name if args.list else "sessions")
+
+    report_fh = args.report.open("w", encoding="utf-8") if args.report else None
+    stats = Stats()
+    moved_clean = moved_bad = move_errors = 0
+    cached_count = 0
+    stop_requested = False
+    t0 = time.monotonic()
+
+    reporter = Reporter(stdscr, label, total, t0, min_interval=args.ui_interval)
+    reporter.update(stats, force=True)
+
+    def _move_done(fut, dest_label: str):
+        """Callback de fin de déplacement : compte le résultat sans jamais
+        faire planter la boucle principale si un move échoue (disque plein,
+        permissions...)."""
+        nonlocal moved_clean, moved_bad, move_errors
+        try:
+            fut.result()
+            if dest_label == "clean":
+                moved_clean += 1
+            else:
+                moved_bad += 1
+        except OSError as exc:
+            move_errors += 1
+            if stdscr is None:
+                print(f"\n  [ERREUR déplacement {dest_label}] {exc}", file=sys.stderr)
+
+    try:
+        # Pool de threads dédié aux déplacements : soumis au fil de l'eau pendant
+        # que le ProcessPoolExecutor continue d'analyser les sessions suivantes —
+        # une session en anomalie part en quarantaine dès qu'elle est détectée,
+        # pas seulement à la toute fin du run (visible en direct dans le dossier).
+        with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker) as pool, \
+             ThreadPoolExecutor(max_workers=max(2, args.workers // 2)) as move_pool:
+            futures = {
+                pool.submit(
+                    _process_one, str(s), args.apply, run_charuco,
+                    args.charuco_sample_fps, args.force,
+                    run_lr_check, args.lr_n_samples, run_quality,
+                ): s
+                for s in sessions
+            }
+            for fut in as_completed(futures):
+                session_dir = futures[fut]
+                result = fut.result()  # _process_one ne lève jamais : pas de try/except requis ici
+                stats.add(result)
+                if result.get("cached"):
+                    cached_count += 1
+                if stdscr is None:
+                    _print_result(result, args.verbose)
+                if report_fh:
+                    report_fh.write(json.dumps(result) + "\n")
+                    report_fh.flush()
+
+                if result["status"] == "OK":
+                    if args.move_clean:
+                        mv = move_pool.submit(shutil.move, str(session_dir), str(args.move_clean / session_dir.name))
+                        mv.add_done_callback(lambda f: _move_done(f, "clean"))
+                elif args.move_bad:
+                    mv = move_pool.submit(shutil.move, str(session_dir), str(args.move_bad / session_dir.name))
+                    mv.add_done_callback(lambda f: _move_done(f, "bad"))
+
+                reporter.update(stats)
+
+                if reporter.quit_requested():
+                    stop_requested = True
+                    pool.shutdown(wait=False, cancel_futures=True)
+                    break
+            # move_pool se ferme ici (context manager) : attend que tous les
+            # déplacements en attente se terminent avant de continuer.
+    finally:
+        if report_fh:
+            report_fh.close()
+
+    reporter.update(stats, force=True)
+
+    elapsed = time.monotonic() - t0
+    meta = {
+        "single": False, "total": total, "elapsed": elapsed, "cached_count": cached_count,
+        "moved_clean": moved_clean, "moved_bad": moved_bad, "move_errors": move_errors,
+        "stopped_early": stop_requested, "apply": args.apply,
+        "move_clean_dir": args.move_clean, "move_bad_dir": args.move_bad,
+    }
+    exit_code = 0 if stats.status_counts.get("ANOMALY", 0) == 0 and stats.status_counts.get("ERROR", 0) == 0 else 1
+    return stats, exit_code, meta
+
+
+def _print_summary(stats, meta: dict, args) -> None:
+    if meta.get("no_args"):
+        return
+    if meta.get("single") or meta.get("total", 0) == 0:
+        return
+
+    extra = " (arrêté avant la fin — touche q)" if meta.get("stopped_early") else ""
+    elapsed = meta.get("elapsed", 0.0)
+    total = meta["total"]
+
+    print(f"\n{'─' * 50}")
+    print(f"Sessions analysées : {stats.done}/{total}  (en {elapsed/60:.1f} min, "
+          f"{stats.done/max(elapsed,1e-6):.1f} sessions/s){extra}")
+    print(f"Depuis le cache    : {meta.get('cached_count', 0)}")
+    print(f"Propres            : {stats.status_counts.get('OK', 0)}")
+    print(f"Anomalies          : {stats.status_counts.get('ANOMALY', 0)}")
+    print(f"Erreurs            : {stats.status_counts.get('ERROR', 0)}")
+    print(f"Score moyen        : {stats.avg_score():.1f} / 100")
+    if stats.done:
+        print("Distribution       : " + "  ".join(
+            f"{g}={stats.grade_counts.get(g, 0)} ({stats.grade_counts.get(g, 0) / stats.done * 100:.1f}%)"
+            for g in GRADES
+        ))
+    crit_avgs = stats.criteria_averages()
+    if crit_avgs:
+        print("Moyennes critères  :")
+        for k, v in sorted(crit_avgs.items()):
+            print(f"  {k:<24} {v:5.1f}")
+    print(f"Problèmes structure (mistral) : {stats.n_mistral_issue}")
+    if stats.issue_counts:
+        print("Problèmes les plus fréquents  :")
+        for name, cnt in stats.top_issues(15):
+            print(f"  {name:<28} {cnt}")
+    if meta.get("move_clean_dir"):
+        print(f"Déplacées (clean)  : {meta.get('moved_clean', 0)}")
+    if meta.get("move_bad_dir"):
+        print(f"Déplacées (bad)    : {meta.get('moved_bad', 0)}")
+    if meta.get("move_errors"):
+        print(f"Échecs déplacement : {meta['move_errors']}")
+    if not meta.get("apply"):
+        print("\n(dry-run — relancez avec --apply pour corriger réellement les noms)")
+
+
+# ─── Point d'entrée ───────────────────────────────────────────────────────────
 
 def main() -> int:
     p = argparse.ArgumentParser(
@@ -337,6 +916,12 @@ def main() -> int:
                    help="Sauter la vérification left/right (corrélation marqueurs 244/255 ↔ Opening_width, nécessite opencv)")
     p.add_argument("--lr-n-samples", type=int, default=10, metavar="N",
                    help="Nombre de frames échantillonnées pour la vérification left/right (défaut : 10)")
+    p.add_argument("--skip-quality", action="store_true",
+                   help="Sauter le scoring qualité 0-100/A-F (checks.py) — comportement historique post/ seul")
+    p.add_argument("--skip-quality-vision", action="store_true",
+                   help="Dans le scoring qualité, sauter les checks vidéo coûteux "
+                        "(tracking gripper ArUco/ChArUco, inversion labels) — garde le score "
+                        "mais basé uniquement sur les métriques structurelles/flux")
     p.add_argument("--move-clean", type=Path, metavar="DEST",
                    help="Déplacer les sessions propres dans ce répertoire")
     p.add_argument("--move-bad", type=Path, metavar="DEST",
@@ -347,145 +932,34 @@ def main() -> int:
                    help="Ignorer le cache .postcheck.json et tout ré-analyser")
     p.add_argument("--report", type=Path, metavar="JSONL",
                    help="Écrire un rapport JSONL (une ligne par session) en plus de stdout")
-    p.add_argument("-v", "--verbose", action="store_true", help="Afficher aussi les sessions sans anomalie")
+    p.add_argument("--ui-interval", type=float, default=0.4,
+                   help="Intervalle minimum (s) entre deux rafraîchissements de l'affichage live")
+    p.add_argument("--no-ui", action="store_true",
+                   help="Désactive le tableau de bord ASCII (curses), force le mode texte simple "
+                        "(utile pour cron/Docker/--report/sortie redirigée)")
+    p.add_argument("-v", "--verbose", action="store_true", help="Afficher aussi les sessions sans anomalie (mode texte)")
     args = p.parse_args()
 
-    run_charuco = not args.skip_charuco
-    run_lr_check = not args.skip_lr_check
+    if not args.session and not args.list and not args.directory:
+        p.print_help()
+        return 1
 
-    if args.session:
-        session_dir = args.session.resolve()
-        result = _process_one(
-            str(session_dir), args.apply, run_charuco, args.charuco_sample_fps, force=True,
-            run_lr_check=run_lr_check, lr_n_samples=args.lr_n_samples,
-        )
-        _print_result(result, verbose=True)
-        return 0
-
-    root = None
-    if args.list:
-        list_path = args.list.resolve()
+    use_ui = (not args.no_ui) and (not args.session) and sys.stdout.isatty()
+    if use_ui:
         try:
-            lines = list_path.read_text(encoding="utf-8").splitlines()
-        except OSError as exc:
-            print(f"Impossible de lire la liste '{list_path}': {exc}")
-            return 1
-        sessions = sorted({
-            Path(l.strip()).resolve() for l in lines if l.strip()
-        })
-        sessions = [s for s in sessions if s.is_dir()]
+            import curses
+        except ImportError:
+            use_ui = False
+
+    if use_ui:
+        stats_or_empty, exit_code, meta = curses.wrapper(_run, args)
     else:
-        if not args.directory:
-            p.print_help()
-            return 1
-        root = args.directory.resolve()
-        sessions = sorted(
-            Path(e.path) for e in os.scandir(root) if e.is_dir(follow_symlinks=False) and e.name.startswith("session_")
-        )
+        stats_or_empty, exit_code, meta = _run(None, args)
 
-    if not sessions:
-        print(f"Aucune session trouvée" + (f" dans {root}" if root else f" dans la liste '{args.list}'"))
-        return 0
+    if not meta.get("single") and not meta.get("no_args"):
+        _print_summary(stats_or_empty, meta, args)
 
-    if args.move_clean:
-        args.move_clean.mkdir(parents=True, exist_ok=True)
-    if args.move_bad:
-        args.move_bad.mkdir(parents=True, exist_ok=True)
-
-    total = len(sessions)
-    print(f"{total} sessions, {args.workers} workers, charuco={'ON' if run_charuco else 'OFF'}, "
-          f"lr-check={'ON' if run_lr_check else 'OFF'}…\n")
-
-    report_fh = args.report.open("w", encoding="utf-8") if args.report else None
-    counts = {"OK": 0, "ANOMALY": 0, "ERROR": 0}
-    moved_clean = moved_bad = move_errors = 0
-    cached_count = 0
-    done = 0
-    t0 = time.time()
-
-    def _move_done(fut, dest_label: str):
-        """Callback de fin de déplacement : compte le résultat sans jamais
-        faire planter la boucle principale si un move échoue (disque plein,
-        permissions...)."""
-        nonlocal moved_clean, moved_bad, move_errors
-        try:
-            fut.result()
-            if dest_label == "clean":
-                moved_clean += 1
-            else:
-                moved_bad += 1
-        except OSError as exc:
-            move_errors += 1
-            print(f"\n  [ERREUR déplacement {dest_label}] {exc}", file=sys.stderr)
-
-    try:
-        # Pool de threads dédié aux déplacements : soumis au fil de l'eau pendant
-        # que le ProcessPoolExecutor continue d'analyser les sessions suivantes —
-        # une session en anomalie part en quarantaine dès qu'elle est détectée,
-        # pas seulement à la toute fin du run (visible en direct dans le dossier).
-        with ProcessPoolExecutor(max_workers=args.workers) as pool, \
-             ThreadPoolExecutor(max_workers=max(2, args.workers // 2)) as move_pool:
-            futures = {
-                pool.submit(
-                    _process_one, str(s), args.apply, run_charuco,
-                    args.charuco_sample_fps, args.force,
-                    run_lr_check, args.lr_n_samples,
-                ): s
-                for s in sessions
-            }
-            for fut in as_completed(futures):
-                session_dir = futures[fut]
-                result = fut.result()  # _process_one ne lève jamais : pas de try/except requis ici
-                done += 1
-                counts[result["status"]] += 1
-                if result.get("cached"):
-                    cached_count += 1
-                _print_result(result, args.verbose)
-                if report_fh:
-                    report_fh.write(json.dumps(result) + "\n")
-                    report_fh.flush()
-
-                if result["status"] == "OK":
-                    if args.move_clean:
-                        mv = move_pool.submit(shutil.move, str(session_dir), str(args.move_clean / session_dir.name))
-                        mv.add_done_callback(lambda f: _move_done(f, "clean"))
-                elif args.move_bad:
-                    mv = move_pool.submit(shutil.move, str(session_dir), str(args.move_bad / session_dir.name))
-                    mv.add_done_callback(lambda f: _move_done(f, "bad"))
-
-                if done % _PROGRESS_EVERY == 0 or done == total:
-                    rate = done / max(time.time() - t0, 1e-6)
-                    eta = (total - done) / rate if rate > 0 else 0
-                    print(
-                        f"  … {done}/{total}  ok={counts['OK']} anomalies={counts['ANOMALY']} "
-                        f"erreurs={counts['ERROR']} cache={cached_count} déplacées={moved_clean + moved_bad}  "
-                        f"({rate:.1f} sessions/s, ETA {eta/60:.1f} min)",
-                        end="\r",
-                    )
-            # move_pool se ferme ici (context manager) : attend que tous les
-            # déplacements en attente se terminent avant de continuer.
-    finally:
-        if report_fh:
-            report_fh.close()
-
-    print()
-
-    elapsed = time.time() - t0
-    print(f"\n{'─' * 50}")
-    print(f"Sessions analysées : {total}  (en {elapsed/60:.1f} min, {total/max(elapsed,1e-6):.1f} sessions/s)")
-    print(f"Depuis le cache    : {cached_count}")
-    print(f"Propres            : {counts['OK']}")
-    print(f"Anomalies          : {counts['ANOMALY']}")
-    print(f"Erreurs            : {counts['ERROR']}")
-    if args.move_clean:
-        print(f"Déplacées (clean)  : {moved_clean}")
-    if args.move_bad:
-        print(f"Déplacées (bad)    : {moved_bad}")
-    if move_errors:
-        print(f"Échecs déplacement : {move_errors}")
-    if not args.apply:
-        print("\n(dry-run — relancez avec --apply pour corriger réellement les noms)")
-    return 0
+    return exit_code
 
 
 if __name__ == "__main__":

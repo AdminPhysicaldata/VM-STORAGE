@@ -94,32 +94,55 @@ def _is_valid_mp4(path: Path) -> bool:
         return False
 
 
-def _check_subdir(dir_path: Path, required: set[str]) -> tuple[set[str], set[str], set[str]]:
-    """Retourne (missing, extra, corrupt) pour un sous-dossier (ou la racine)."""
+def _check_subdir(
+    dir_path: Path, required: set[str], aliases: dict[str, str] | None = None,
+) -> tuple[set[str], set[str], set[str]]:
+    """Retourne (missing, extra, corrupt) pour un sous-dossier (ou la racine).
+
+    `aliases` (ex : {"wall": "head"}) tolère un nom de fichier alternatif :
+    "wall.mp4" sur disque est traité comme s'il s'appelait "head.mp4" pour
+    le calcul missing/extra/corrupt, sans jamais renommer le fichier réel.
+    """
     if not dir_path.is_dir():
         return set(required), set(), set()
-    present = {e.name for e in os.scandir(dir_path) if e.is_file() and e.name not in _IGNORE_ANYWHERE}
+    aliases = aliases or {}
+    raw_present = {e.name for e in os.scandir(dir_path) if e.is_file() and e.name not in _IGNORE_ANYWHERE}
+
+    # nom canonique (après alias) -> nom réel sur disque
+    name_map: dict[str, str] = {}
+    for name in raw_present:
+        stem, dot, ext = name.partition(".")
+        canon = f"{aliases.get(stem, stem)}{dot}{ext}"
+        name_map[canon] = name
+
+    present = set(name_map)
     missing = required - present
     extra = present - required
 
     corrupt: set[str] = set()
-    for name in required & present:
-        path = dir_path / name
-        if name.endswith(".jsonl") and not _is_valid_jsonl(path):
-            corrupt.add(name)
-        elif name.endswith(".mp4") and not _is_valid_mp4(path):
-            corrupt.add(name)
-        elif name.endswith(".json") and path.stat().st_size == 0:
-            corrupt.add(name)
+    for canon_name in required & present:
+        path = dir_path / name_map[canon_name]
+        if canon_name.endswith(".jsonl") and not _is_valid_jsonl(path):
+            corrupt.add(canon_name)
+        elif canon_name.endswith(".mp4") and not _is_valid_mp4(path):
+            corrupt.add(canon_name)
+        elif canon_name.endswith(".json") and path.stat().st_size == 0:
+            corrupt.add(canon_name)
 
     return missing, extra, corrupt
+
+
+# "wall" est un nom alternatif toléré pour la caméra fixe "head".
+_CAMERA_ALIASES = {"wall": "head"}
 
 
 def check_session(session_dir: Path) -> IntegrityReport:
     report = IntegrityReport(session_name=session_dir.name)
 
     root_missing, root_extra, root_corrupt = _check_subdir(session_dir, _ROOT_REQUIRED)
-    cam_missing, cam_extra, cam_corrupt = _check_subdir(session_dir / "cameras", _CAMERA_REQUIRED)
+    cam_missing, cam_extra, cam_corrupt = _check_subdir(
+        session_dir / "cameras", _CAMERA_REQUIRED, aliases=_CAMERA_ALIASES
+    )
     sens_missing, sens_extra, sens_corrupt = _check_subdir(session_dir / "sensors", _SENSOR_REQUIRED)
 
     if root_missing:

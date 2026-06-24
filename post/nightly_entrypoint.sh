@@ -13,6 +13,9 @@ WORKERS="${WORKERS:-4}"
 RUN_AT="${RUN_AT:-03:00}"                      # HH:MM, heure locale du conteneur (TZ)
 APPLY="${APPLY:-0}"                            # 0 = dry-run (recommandé), 1 = --apply réel
 SKIP_CHARUCO="${SKIP_CHARUCO:-0}"
+SKIP_LR_CHECK="${SKIP_LR_CHECK:-0}"
+SKIP_QUALITY="${SKIP_QUALITY:-0}"               # 1 = désactive le scoring qualité 0-100/A-F (checks.py)
+SKIP_QUALITY_VISION="${SKIP_QUALITY_VISION:-0}" # 1 = scoring qualité sans les checks vidéo coûteux
 KEEP_REPORTS="${KEEP_REPORTS:-30}"             # nb de rapports JSONL conservés
 LOCK_FILE=/tmp/post_pipeline.lock
 RUN_NOW="${RUN_NOW:-0}"                        # 1 = lance un passage immédiat au démarrage (debug)
@@ -25,9 +28,12 @@ run_once() {
     local ts args report
     ts=$(date +%Y%m%d_%H%M%S)
     report="$REPORTS_DIR/report-$ts.jsonl"
-    args=(-j "$WORKERS" --report "$report")
+    args=(-j "$WORKERS" --report "$report" --no-ui)
     [ "$APPLY" = "1" ] && args+=(--apply)
     [ "$SKIP_CHARUCO" = "1" ] && args+=(--skip-charuco)
+    [ "$SKIP_LR_CHECK" = "1" ] && args+=(--skip-lr-check)
+    [ "$SKIP_QUALITY" = "1" ] && args+=(--skip-quality)
+    [ "$SKIP_QUALITY_VISION" = "1" ] && args+=(--skip-quality-vision)
     [ -n "$QUARANTINE_DIR" ] && args+=(--move-bad "$QUARANTINE_DIR")
 
     log "démarrage run_pipeline.py sur $SESSIONS_DIR ${args[*]}"

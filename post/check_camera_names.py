@@ -1,17 +1,19 @@
 #!/usr/bin/env python3
 """Détecte les sessions dont les caméras (ou capteurs) ont des noms inattendus.
 
-Par défaut les noms attendus sont : left, right, head (sous-dossier "cameras").
-Toute entrée avec un nom différent est signalée.
+Par défaut les noms attendus sont : left, right, wall (sous-dossier "cameras").
+"wall" est le nom canonique de la caméra fixe (remplace "head" — une session
+qui a encore "head" est donc signalée ici comme inattendue, à renommer via
+fix_camera_names.py). Toute entrée avec un nom différent est signalée.
 
 Usage :
     python3 check_camera_names.py /media/qbee/T9/sessions/
-    python3 check_camera_names.py /media/qbee/T9/sessions/ --expected left right head front
+    python3 check_camera_names.py /media/qbee/T9/sessions/ --expected left right wall front
     python3 check_camera_names.py /media/qbee/T9/sessions/ -m /media/qbee/T9/bad/
     python3 check_camera_names.py --sftp
     python3 check_camera_names.py /media/qbee/T9/sessions/ -j 16
 
-    # Vérifier le sous-dossier sensors/ (noms attendus différents : pas de "head")
+    # Vérifier le sous-dossier sensors/ (noms attendus différents : pas de "wall")
     python3 check_camera_names.py /media/qbee/T9/sessions/ --subdir sensors --expected left right
 """
 from __future__ import annotations
@@ -26,7 +28,7 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-_DEFAULT_EXPECTED = {"left", "right", "head"}
+_DEFAULT_EXPECTED = {"left", "right", "wall"}  # "wall" est le nom canonique (remplace "head")
 _IGNORE_FILES = {"resample_report.json", "resampled_30hz.jsonl"}
 _VIDEO_EXT = {".mp4", ".mkv", ".avi", ".mov"}
 _DEFAULT_WORKERS = min(32, (os.cpu_count() or 4) * 4)

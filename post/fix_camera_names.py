@@ -8,9 +8,10 @@ Applique les corrections partout :
   - Contenu des .jsonl caméra       (si le nom apparaît dans les données)
 
 Stratégie de résolution du typo → nom correct :
-  1. Lowercase exact  : "Left"     → "left"
-  2. Strip préfixes   : "fix_head" → "head"
-  3. Levenshtein ≤ 2  : "leaft"   → "left"
+  1. Alias connu      : "head"    → "wall"   (nom canonique désormais "wall")
+  2. Lowercase exact  : "Left"     → "left"
+  3. Strip préfixes   : "fix_wall" → "wall"
+  4. Levenshtein ≤ 2  : "leaft"   → "left"
 
 Usage :
     # Dry-run (voir ce qui sera changé sans toucher aux fichiers)
@@ -42,7 +43,11 @@ import threading
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
-_DEFAULT_EXPECTED = {"left", "right", "head"}
+_DEFAULT_EXPECTED = {"left", "right", "wall"}  # "wall" est le nom canonique (remplace "head")
+# Alias connus à normaliser systématiquement vers le nom canonique, même quand
+# la distance de Levenshtein est trop grande pour que la résolution générique
+# (ci-dessous) les rapproche d'elle-même : "head" → "wall" sur ce rig.
+_KNOWN_ALIASES = {"head": "wall"}
 _RESAMPLED_FILENAME = "resampled_30hz.jsonl"
 # resample_report.json n'a aucune référence de nom de caméra (juste des stats) → rien à corriger.
 # resampled_30hz.jsonl EN A (clés "frames"."left"/"right"/"head" + chemins "file") mais c'est du
@@ -97,18 +102,24 @@ def resolve(name: str, expected: frozenset[str]) -> str | None:
 
     low = name.lower()
 
-    # 1. Lowercase direct
+    # 1. Alias connu (ex : "head" → "wall"), même si la cible n'est pas "proche"
+    #    au sens Levenshtein — c'est une renommée délibérée, pas une faute de frappe.
+    alias = _KNOWN_ALIASES.get(low)
+    if alias is not None and alias in expected:
+        return alias
+
+    # 2. Lowercase direct
     if low in expected:
         return low
 
-    # 2. Strip préfixes connus
+    # 3. Strip préfixes connus
     for prefix in _STRIP_PREFIXES:
         if low.startswith(prefix):
             candidate = low[len(prefix):]
             if candidate in expected:
                 return candidate
 
-    # 3. Levenshtein ≤ 2 (après lowercase)
+    # 4. Levenshtein ≤ 2 (après lowercase)
     best, best_d = None, 3
     for exp in expected:
         d = _lev(low, exp)
