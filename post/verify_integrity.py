@@ -38,10 +38,11 @@ from pathlib import Path
 _CAM_NAMES = ("left", "right", "head")
 _SENSOR_NAMES = ("left", "right")
 
-# Fichiers générés par l'outillage lui-même (cache de run_pipeline.py, etc.) —
-# jamais signalés comme "en trop", sinon une session validée comme "propre"
-# ne le resterait jamais après son premier passage dans le pipeline.
-_IGNORE_ANYWHERE = {".postcheck.json"}
+# Fichiers générés par l'outillage lui-même (cache de run_pipeline.py, scoring
+# qualité treatment-worker, etc.) — jamais signalés comme "en trop", sinon une
+# session validée comme "propre" ne le resterait jamais après son premier
+# passage dans le pipeline.
+_IGNORE_ANYWHERE = {".postcheck.json", "gripper_tracking.csv", "gripper_correlation.json"}
 
 _ROOT_REQUIRED = {"config.json", "mission.json", "analysis.json", "result.json", "postprocess.log"}
 _CAMERA_REQUIRED = (

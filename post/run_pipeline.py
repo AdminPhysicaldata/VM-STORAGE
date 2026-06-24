@@ -113,6 +113,13 @@ from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 os.environ.setdefault("NAS_SESSIONS_DIR", "")
+# Le scoring qualité (checks.py → gripper_tracking.py, check #12) écrit par
+# défaut gripper_tracking.csv/gripper_correlation.json dans la session — ce
+# qui est le comportement voulu en production (treatment-worker), mais ferait
+# échouer verify_integrity.py ici (fichiers "en trop") sur des sessions par
+# ailleurs propres. Le post-pipeline reste un audit, donc on désactive cette
+# écriture (cf. gripper_tracking.WRITE_OUTPUTS).
+os.environ.setdefault("GRIPPER_TRACKING_WRITE_OUTPUT", "false")
 
 import fix_camera_names
 import verify_camera_sync

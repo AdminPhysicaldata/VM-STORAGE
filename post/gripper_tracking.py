@@ -53,6 +53,12 @@ MARKER_SIZE_MM  = float(os.environ.get("TRACKING_MARKER_SIZE_MM", "50.0"))
 ARUCO_DICT_NAME = os.environ.get("TRACKING_ARUCO_DICT",           "DICT_4X4_50")
 MIN_CROSS_CORR  = float(os.environ.get("TRACKING_MIN_CROSS_CORR", "0.70"))
 OUTPUT_CSV_NAME = os.environ.get("TRACKING_CSV_NAME",             "gripper_tracking.csv")
+# Désactivé par post/run_pipeline.py (audit en lecture seule) : écrire ces
+# fichiers dans la session ferait échouer verify_integrity.py (fichiers "en
+# trop" non attendus), même quand la session est par ailleurs parfaitement
+# propre. En production (treatment-worker), ces fichiers sont le livrable
+# attendu du check #12 → on les laisse s'écrire par défaut (True).
+WRITE_OUTPUTS   = os.environ.get("GRIPPER_TRACKING_WRITE_OUTPUT", "true").lower() == "true"
 
 # Configuration ChArUco (board 3×3 = 5 marqueurs, 4 coins intérieurs)
 CHARUCO_SQUARES_X   = int(os.environ.get("CHARUCO_SQUARES_X",          "3"))
@@ -1629,7 +1635,7 @@ def run(session_path: str, meta: dict = None) -> dict:
 
     csv_path  = None
     corr_path = None
-    if csv_rows:
+    if csv_rows and WRITE_OUTPUTS:
         csv_path  = _write_csv(session_path, csv_rows)
         corr_path = _write_correlation_json(session_path, trajectory_correlation)
         n_final = sum(1 for r in csv_rows if r["source"] == "final")
