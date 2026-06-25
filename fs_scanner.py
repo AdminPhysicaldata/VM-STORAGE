@@ -16,9 +16,16 @@ Vérification d'intégrité (_check_files_integrity) :
   et le détail est ajouté à la liste d'erreurs envoyée au backend.
 
 Modes :
-  --once   Scan complet ultra-rapide (multiprocessing + écritures HTTP en
-           parallèle) puis quitte. Idéal pour rattraper un backlog.
-  --watch  Surveillance continue avec polling du FS (défaut).
+  --once      Scan complet ultra-rapide (multiprocessing + écritures HTTP en
+              parallèle) puis quitte. Idéal pour rattraper un backlog.
+  --watch     Surveillance continue avec polling du FS (défaut).
+  --ultrafast Scan brut maximal en threads/process : ne lit/valide AUCUN
+              fichier de capture (pas de score, pas de check intégrité),
+              se contente de constater la présence des dossiers de session
+              sur chaque disque (SSD + HDD), de synchroniser ces disques en
+              BDD, et de calculer le nombre de sessions + le nombre d'heures
+              capturées par disque (via analysis.json, lu en best-effort).
+              N'écrit aucun score en BDD. Voir run_ultrafast().
 
 Architecture --once :
   1. os.scandir() → liste des dossiers
@@ -55,6 +62,9 @@ Variables d'environnement :
   KPI_RECALC_INTERVAL     Intervalle recalcul KPI en s (mode --watch, défaut: 60)
   BACKEND_URL             URL de base de l'API backend   (défaut: http://vm-backend:5000/api)
   INTERNAL_API_TOKEN      Jeton d'authentification interne (header X-Internal-Token)
+  ULTRAFAST_WORKERS       Processus parallèles (--ultrafast) (défaut: nb CPUs)
+  ULTRAFAST_THREADS_PER_WORKER
+                          Threads I/O par processus (--ultrafast) (défaut: 32)
 """
 
 import glob
@@ -75,6 +85,12 @@ logger = logging.getLogger(__name__)
 SESSIONS_DIR      = os.environ.get("SESSIONS_DIR",      "/data/sessions")
 SCAN_WORKERS      = int(os.environ.get("SCAN_WORKERS",  str(max(1, (cpu_count() or 4)))))
 HTTP_WORKERS      = int(os.environ.get("HTTP_WORKERS",  "8"))
+
+# --ultrafast : lecture brute du disque, pas de validation de contenu —
+# on peut donc monter beaucoup plus haut en parallélisme que le scan normal
+# (pas de parsing mp4/jsonl coûteux, juste un éventuel petit analysis.json).
+ULTRAFAST_WORKERS = int(os.environ.get("ULTRAFAST_WORKERS") or max(1, (cpu_count() or 4)))
+ULTRAFAST_THREADS_PER_WORKER = int(os.environ.get("ULTRAFAST_THREADS_PER_WORKER", "32"))
 HTTP_BATCH_SIZE   = int(os.environ.get("HTTP_BATCH_SIZE", "200"))
 STABILITY_SECONDS = int(os.environ.get("STABILITY_SECONDS", "60"))
 SCAN_INTERVAL     = int(os.environ.get("SCAN_INTERVAL", "15"))
@@ -856,6 +872,131 @@ def run_once():
                     clean_duration_sec, time.monotonic() - t0)
 
 
+# ── Mode --ultrafast : scan brut disque, sans validation de contenu ───────────
+# Objectif : énumérer les sessions présentes sur chaque disque (SSD + HDD) le
+# plus vite possible, sans rien lire/valider dans les fichiers de capture
+# (pas de score, pas de check mp4/jsonl). On considère qu'une session est
+# "valide" dès que son dossier existe sur le disque (validation d'emplacement
+# uniquement). On essaie en best-effort de lire analysis.json (s'il existe)
+# pour en tirer la durée, afin de pouvoir totaliser le nombre d'heures par
+# disque — mais une session sans analysis.json (ou illisible) compte tout de
+# même dans le total de sessions, juste avec 0h.
+
+def _ultrafast_scan_one(base_dir: str, folder_name: str) -> tuple:
+    """Retourne (folder_name, duration_sec, has_analysis) — ne lève jamais,
+    ne vérifie aucune intégrité de fichier (pas de mp4/jsonl/config.json)."""
+    analysis_path = Path(base_dir) / folder_name / "analysis.json"
+    try:
+        with open(analysis_path, "r", encoding="utf-8", errors="replace") as f:
+            analysis = json.load(f)
+        return folder_name, _session_duration_sec(analysis), True
+    except Exception:
+        return folder_name, 0.0, False
+
+
+def _ultrafast_scan_chunk(args: tuple) -> tuple:
+    """Worker process : args = (mount_path, [folder_name, ...]).
+    Retourne (mount_path, [(folder_name, duration_sec, has_analysis), ...])."""
+    mount_path, folder_names = args
+    workers = min(ULTRAFAST_THREADS_PER_WORKER, len(folder_names)) or 1
+    with ThreadPoolExecutor(max_workers=workers) as pool:
+        results = list(pool.map(
+            lambda fname: _ultrafast_scan_one(mount_path, fname),
+            folder_names,
+        ))
+    return mount_path, results
+
+
+def _print_ultrafast_summary(stats: dict, elapsed: float) -> None:
+    """Affiche, par disque, le nombre de sessions et le total d'heures
+    capturées (calcul brut, sans aucune notion de score/qualité)."""
+    sep = "─" * 56
+    lines = ["", f"┌{sep}┐", f"│{'BILAN ULTRAFAST':^56}│", f"├{sep}┤"]
+
+    total_sessions = total_with_analysis = 0
+    total_duration_sec = 0.0
+    for mount_path, s in stats.items():
+        h = int(s["duration_sec"] // 3600)
+        m = int((s["duration_sec"] % 3600) // 60)
+        label = f"{mount_path} ({s['disk_type']})"
+        lines.append(f"│  {label:<35} {s['sessions']:>6} sess. {f'{h}h{m:02d}':>9}  │")
+        total_sessions       += s["sessions"]
+        total_with_analysis  += s["with_analysis"]
+        total_duration_sec   += s["duration_sec"]
+
+    th = int(total_duration_sec // 3600)
+    tm = int((total_duration_sec % 3600) // 60)
+    lines += [
+        f"├{sep}┤",
+        f"│  Total sessions (tous disques)      : {total_sessions:>10}        │",
+        f"│  Dont avec analysis.json lisible     : {total_with_analysis:>10}        │",
+        f"│  Total heures capturées (brut)       : {f'{th}h {tm:02d}min':>10}        │",
+        f"├{sep}┤",
+        f"│  Temps de traitement                 : {elapsed:>9.1f}s        │",
+        f"└{sep}┘",
+        "",
+    ]
+    for line in lines:
+        logger.info(line)
+
+
+def run_ultrafast():
+    """
+    Scan ultrafast :
+      1. Découvre tous les disques (SSD + HDD, explicites + auto-découverts)
+      2. Liste les dossiers de session sur chacun (os.scandir, pas de stat)
+      3. ProcessPoolExecutor (ULTRAFAST_WORKERS) + ThreadPoolExecutor par
+         processus (ULTRAFAST_THREADS_PER_WORKER) → lecture best-effort de
+         analysis.json uniquement, AUCUNE validation de contenu/intégrité
+      4. Synchronise les disques (et leurs dossiers) en BDD via le backend
+      5. Bilan : nombre de sessions + nombre d'heures par disque
+    """
+    logger.info("=== fs_scanner --ultrafast | workers=%d threads/worker=%d ===",
+                ULTRAFAST_WORKERS, ULTRAFAST_THREADS_PER_WORKER)
+
+    t0 = time.monotonic()
+
+    disks = [d for d in _discover_disks() if os.path.isdir(d["mount_path"])]
+    if not disks:
+        logger.info("Aucun disque monté trouvé. Rien à faire.")
+        return
+
+    disk_folders = {d["mount_path"]: _list_sessions(d["mount_path"]) for d in disks}
+    disk_type_by_path = {d["mount_path"]: d["disk_type"] for d in disks}
+
+    total_sessions = sum(len(f) for f in disk_folders.values())
+    logger.info("Disques détectés : %d | sessions sur disque (total) : %d",
+                len(disks), total_sessions)
+
+    stats = {
+        mp: {"sessions": len(folders), "with_analysis": 0, "duration_sec": 0.0,
+             "disk_type": disk_type_by_path[mp]}
+        for mp, folders in disk_folders.items()
+    }
+
+    chunks = []
+    for mount_path, folders in disk_folders.items():
+        if not folders:
+            continue
+        chunk_size = max(1, len(folders) // (ULTRAFAST_WORKERS * 4))
+        for i in range(0, len(folders), chunk_size):
+            chunks.append((mount_path, folders[i:i + chunk_size]))
+
+    if chunks:
+        with ProcessPoolExecutor(max_workers=ULTRAFAST_WORKERS) as pool:
+            for mount_path, results in pool.map(_ultrafast_scan_chunk, chunks, chunksize=1):
+                s = stats[mount_path]
+                for _folder_name, duration_sec, has_analysis in results:
+                    s["duration_sec"] += duration_sec
+                    if has_analysis:
+                        s["with_analysis"] += 1
+
+    # ── Disques + dossiers en BDD ───────────────────────────────────────────
+    _scan_disks()
+
+    _print_ultrafast_summary(stats, time.monotonic() - t0)
+
+
 # ── Mode --watch : surveillance continue ──────────────────────────────────────
 
 def _fetch_and_process(fname: str) -> tuple:
@@ -1003,7 +1144,9 @@ if __name__ == "__main__":
         format="%(asctime)s [%(levelname)s] fs_scanner: %(message)s",
     )
 
-    if "--once" in sys.argv:
+    if "--ultrafast" in sys.argv:
+        run_ultrafast()
+    elif "--once" in sys.argv:
         run_once()
     else:
         watch_loop()

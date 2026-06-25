@@ -83,19 +83,21 @@ services:
     container_name: fs-scanner
     restart: always
     volumes:
-      - sessions_data:/data/sessions:ro
+      - sessions_data:${SESSIONS_DIR:-/data/sessions}:ro
       - /mnt:/mnt:ro
     environment:
-      SESSIONS_DIR: /data/sessions
+      SESSIONS_DIR: ${SESSIONS_DIR:-/data/sessions}
       BACKEND_URL: http://${VM_BACKEND_IP}:5000/api
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
       SCAN_INTERVAL: ${FS_SCANNER_INTERVAL:-15}
       STABILITY_SECONDS: ${FS_SCANNER_STABILITY:-60}
-      DISK_MOUNTS: ${DISK_MOUNTS:-/data/sessions:ssd:SSD principal:local-ssd-data}
+      DISK_MOUNTS: ${DISK_MOUNTS:-${SESSIONS_DIR:-/data/sessions}:ssd:SSD principal:local-ssd-data}
       DISK_AUTODISCOVER_GLOB: ${DISK_AUTODISCOVER_GLOB:-/mnt/*}
       DISK_SCAN_INTERVAL: ${DISK_SCAN_INTERVAL:-300}
       HTTP_WORKERS: ${FS_SCANNER_HTTP_WORKERS:-8}
       SERVER_GROUP: ${FS_SCANNER_SERVER_GROUP:-MADA}
+      ULTRAFAST_WORKERS: ${FS_SCANNER_ULTRAFAST_WORKERS:-}
+      ULTRAFAST_THREADS_PER_WORKER: ${FS_SCANNER_ULTRAFAST_THREADS:-32}
 
   sync-ssd-hdd:
     platform: linux/amd64
