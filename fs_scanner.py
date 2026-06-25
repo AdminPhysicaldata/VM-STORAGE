@@ -1,8 +1,10 @@
 #!/usr/bin/env python3
 """
-fs_scanner.py — Scanne /data/sessions directement sur vm-storage (pas de SFTP),
-lie les sessions à la BDD via le backend HTTP (vm-backend), et met à jour les
-KPIs. Aucun accès direct à PostgreSQL : tout passe par BACKEND_URL (comme
+fs_scanner.py — Scanne directement sur vm-storage (pas de SFTP) tous les
+disques montés (SSD + HDD, voir DISK_MOUNTS/DISK_AUTODISCOVER_GLOB plus bas
+et _active_scan_dirs) — pas seulement SESSIONS_DIR — lie les sessions à la
+BDD via le backend HTTP (vm-backend), et met à jour les KPIs. Aucun accès
+direct à PostgreSQL : tout passe par BACKEND_URL (comme
 sessions-uploader/SessionsToMistral.py).
 
 Vérification d'intégrité (_check_files_integrity) :
@@ -28,12 +30,14 @@ Modes :
               N'écrit aucun score en BDD. Voir run_ultrafast().
 
 Architecture --once :
-  1. os.scandir() → liste des dossiers
+  1. _active_scan_dirs() → liste des disques montés, puis os.scandir() sur
+     chacun → liste des dossiers (un même folder_name vu sur plusieurs
+     disques n'est traité qu'une fois, sur le premier disque rencontré)
   2. ProcessPoolExecutor (SCAN_WORKERS processus) → chaque processus traite
-     un chunk de sessions, et utilise lui-même un ThreadPoolExecutor
-     (SCAN_THREADS_PER_WORKER threads) pour paralléliser l'I/O par session
-     (lecture JSON, parcours des atomes mp4, lecture jsonl) — tout en local,
-     aucun accès réseau dans cette étape
+     un chunk de sessions d'UN SEUL disque, et utilise lui-même un
+     ThreadPoolExecutor (SCAN_THREADS_PER_WORKER threads) pour paralléliser
+     l'I/O par session (lecture JSON, parcours des atomes mp4, lecture
+     jsonl) — tout en local, aucun accès réseau dans cette étape
   3. ThreadPoolExecutor (HTTP_WORKERS threads) → POST du résultat de chaque
      session vers /api/pipeline/sessions/scan-result (le backend résout ou
      crée la session et écrit le score)
@@ -546,9 +550,9 @@ def _list_sessions(sessions_dir: str) -> list:
         return []
 
 
-def _analysis_stat(folder_name: str) -> tuple | None:
+def _analysis_stat(base_dir: str, folder_name: str) -> tuple | None:
     """Retourne (size, mtime) d'analysis.json ou None si absent."""
-    path = Path(SESSIONS_DIR) / folder_name / "analysis.json"
+    path = Path(base_dir) / folder_name / "analysis.json"
     try:
         st = path.stat()
         return st.st_size, st.st_mtime
@@ -556,10 +560,10 @@ def _analysis_stat(folder_name: str) -> tuple | None:
         return None
 
 
-def _get_folder_size(folder_name: str) -> int:
+def _get_folder_size(base_dir: str, folder_name: str) -> int:
     """Taille récursive d'un dossier session via os.scandir."""
     total = 0
-    stack = [str(Path(SESSIONS_DIR) / folder_name)]
+    stack = [str(Path(base_dir) / folder_name)]
     while stack:
         try:
             with os.scandir(stack.pop()) as it:
@@ -574,6 +578,18 @@ def _get_folder_size(folder_name: str) -> int:
         except OSError:
             pass
     return total
+
+
+def _active_scan_dirs() -> list:
+    """
+    Liste les disques (SSD + HDD, explicites via DISK_MOUNTS + auto-découverts
+    via DISK_AUTODISCOVER_GLOB) actuellement montés — c'est la source unique
+    de vérité pour savoir où chercher des sessions, en mode --once/--watch
+    comme en --ultrafast. Permet de scanner plusieurs disques en parallèle au
+    lieu d'un unique SESSIONS_DIR, sans rien ajouter à configurer : tout vient
+    déjà de DISK_MOUNTS/DISK_AUTODISCOVER_GLOB (.env).
+    """
+    return [d for d in _discover_disks() if os.path.isdir(d["mount_path"])]
 
 
 # ── Disques de stockage (SSD/HDD) ───────────────────────────────────────────────
@@ -754,27 +770,41 @@ def run_once():
       3. ThreadPoolExecutor : POST de chaque résultat vers le backend
       4. Recalcul KPI final via le backend
     """
-    logger.info("=== fs_scanner --once | workers=%d http_workers=%d dir=%s backend=%s ===",
-                SCAN_WORKERS, HTTP_WORKERS, SESSIONS_DIR, BACKEND_URL)
+    logger.info("=== fs_scanner --once | workers=%d http_workers=%d backend=%s ===",
+                SCAN_WORKERS, HTTP_WORKERS, BACKEND_URL)
 
     t0 = time.monotonic()
 
-    # ── Étape 1 : liste FS (tout retraiter sans exception) ────────────────────
-    to_scan = _list_sessions(SESSIONS_DIR)
+    # ── Étape 1 : liste FS sur tous les disques montés (tout retraiter) ───────
+    disks = _active_scan_dirs()
+    if not disks:
+        logger.info("Aucun disque monté trouvé. Rien à faire.")
+        return
 
-    logger.info("Total dossiers : %d | mode full-rescan (aucun filtrage)", len(to_scan))
+    seen: set = set()
+    disk_folders: list = []  # [(mount_path, [folder_name, ...]), ...]
+    for d in disks:
+        folders = [f for f in _list_sessions(d["mount_path"]) if f not in seen]
+        seen.update(folders)
+        if folders:
+            disk_folders.append((d["mount_path"], folders))
 
-    if not to_scan:
+    to_scan_count = len(seen)
+    logger.info("Disques : %d | total dossiers : %d | mode full-rescan (aucun filtrage)",
+                len(disks), to_scan_count)
+
+    if to_scan_count == 0:
         logger.info("Rien à faire.")
         return
 
     # ── Étape 2 : scan parallèle par chunks (local, sans réseau) ───────────────
-    chunk_size = max(1, len(to_scan) // (SCAN_WORKERS * 4))
-    chunks = [
-        (SESSIONS_DIR, to_scan[i:i + chunk_size])
-        for i in range(0, len(to_scan), chunk_size)
-    ]
-    logger.info("Chunks : %d × ~%d sessions | %d processus", len(chunks), chunk_size, SCAN_WORKERS)
+    # Un chunk ne mélange jamais deux disques (sessions_dir unique par chunk).
+    chunks = []
+    for mount_path, folders in disk_folders:
+        chunk_size = max(1, len(folders) // (SCAN_WORKERS * 4))
+        for i in range(0, len(folders), chunk_size):
+            chunks.append((mount_path, folders[i:i + chunk_size]))
+    logger.info("Chunks : %d | %d processus", len(chunks), SCAN_WORKERS)
 
     ok = skipped = failed = no_analysis = 0
     valid_count = 0
@@ -868,7 +898,7 @@ def run_once():
     _scan_disks()
 
     # ── Bilan final ────────────────────────────────────────────────────────────
-    _print_summary(len(to_scan), valid_count, total_duration_sec,
+    _print_summary(to_scan_count, valid_count, total_duration_sec,
                     clean_duration_sec, time.monotonic() - t0)
 
 
@@ -956,7 +986,7 @@ def run_ultrafast():
 
     t0 = time.monotonic()
 
-    disks = [d for d in _discover_disks() if os.path.isdir(d["mount_path"])]
+    disks = _active_scan_dirs()
     if not disks:
         logger.info("Aucun disque monté trouvé. Rien à faire.")
         return
@@ -999,10 +1029,11 @@ def run_ultrafast():
 
 # ── Mode --watch : surveillance continue ──────────────────────────────────────
 
-def _fetch_and_process(fname: str) -> tuple:
-    """Lit analysis.json/config.json localement, évalue le score, puis
-    POST le résultat au backend. Retourne (fname, success, msg)."""
-    base = Path(SESSIONS_DIR) / fname
+def _fetch_and_process(base_dir: str, fname: str) -> tuple:
+    """Lit analysis.json/config.json localement (sur le disque base_dir),
+    évalue le score, puis POST le résultat au backend.
+    Retourne (fname, success, msg)."""
+    base = Path(base_dir) / fname
     try:
         with open(base / "analysis.json", "r", encoding="utf-8") as f:
             analysis = json.load(f)
@@ -1018,7 +1049,7 @@ def _fetch_and_process(fname: str) -> tuple:
         except Exception:
             pass
 
-    size_bytes = _get_folder_size(fname)
+    size_bytes = _get_folder_size(base_dir, fname)
     score, grade, errors, warnings = _evaluate_session(base, analysis, config)
     duration_sec = _session_duration_sec(analysis)
 
@@ -1035,17 +1066,20 @@ def _fetch_and_process(fname: str) -> tuple:
 
 def watch_loop():
     """
-    Surveillance continue du dossier sessions.
-    Détecte les nouveaux dossiers, attend la stabilité d'analysis.json,
-    puis traite avec un ThreadPoolExecutor.
+    Surveillance continue de tous les disques montés (SSD + HDD, voir
+    _active_scan_dirs). Détecte les nouveaux dossiers sur chaque disque,
+    attend la stabilité d'analysis.json, puis traite avec un
+    ThreadPoolExecutor. Un même folder_name n'est suivi que sur le premier
+    disque où il est rencontré (cas normalement impossible en pratique).
     """
-    logger.info("=== fs_scanner --watch | intervalle=%ds stabilité=%ds dir=%s backend=%s ===",
-                SCAN_INTERVAL, STABILITY_SECONDS, SESSIONS_DIR, BACKEND_URL)
+    logger.info("=== fs_scanner --watch | intervalle=%ds stabilité=%ds backend=%s ===",
+                SCAN_INTERVAL, STABILITY_SECONDS, BACKEND_URL)
 
     processed: set   = _load_already_scored()
-    # {folder_name: (size, mtime, first_stable_ts)}
+    # {folder_name: (size, mtime, first_stable_ts, base_dir)}
     pending_stable: dict = {}
-    pending_db:     set  = set()
+    # {folder_name: base_dir}
+    pending_db:     dict = {}
 
     logger.info("%d session(s) déjà traitées", len(processed))
 
@@ -1061,52 +1095,56 @@ def watch_loop():
             last_disk_scan = now
 
         # ── 1. Vérifier stabilité en parallèle ─────────────────────────────────
-        newly_stable = []
+        newly_stable = []  # [(fname, base_dir), ...]
         still_watching = {}
 
         if pending_stable:
             def _check_one(item):
-                fname, (ps, pm, fs) = item
-                stat = _analysis_stat(fname)
-                return fname, (ps, pm, fs), stat
+                fname, (ps, pm, fs, base_dir) = item
+                stat = _analysis_stat(base_dir, fname)
+                return fname, (ps, pm, fs, base_dir), stat
 
             with ThreadPoolExecutor(max_workers=min(SCAN_WORKERS, len(pending_stable))) as pool:
-                for fname, (ps, pm, fs), stat in pool.map(_check_one, pending_stable.items()):
+                for fname, (ps, pm, fs, base_dir), stat in pool.map(_check_one, pending_stable.items()):
                     if stat is None:
                         logger.debug("%s : analysis.json disparu, abandon", fname)
                         continue
                     cs, cm = stat
                     if cs != ps or cm != pm:
-                        still_watching[fname] = (cs, cm, now)
+                        still_watching[fname] = (cs, cm, now, base_dir)
                     elif now - fs >= STABILITY_SECONDS:
-                        newly_stable.append(fname)
+                        newly_stable.append((fname, base_dir))
                     else:
-                        still_watching[fname] = (cs, cm, fs)
+                        still_watching[fname] = (cs, cm, fs, base_dir)
 
         pending_stable = still_watching
 
         # ── 2. Traiter les sessions stables ────────────────────────────────────
         if newly_stable:
+            newly_stable_dirs = dict(newly_stable)
             with ThreadPoolExecutor(max_workers=min(HTTP_WORKERS, len(newly_stable))) as pool:
-                for fname, success, msg in pool.map(_fetch_and_process, newly_stable):
+                for fname, success, msg in pool.map(
+                    lambda item: _fetch_and_process(item[1], item[0]), newly_stable,
+                ):
                     if success:
                         processed.add(fname)
                         logger.info("%s : %s", fname, msg)
                     else:
-                        pending_db.add(fname)
+                        pending_db[fname] = newly_stable_dirs[fname]
                         logger.debug("%s : échec — %s, réessai prochain cycle", fname, msg)
 
         # ── 3. Retry pending_db ─────────────────────────────────────────────────
         if pending_db:
-            still_pending = set()
+            still_pending = {}
             with ThreadPoolExecutor(max_workers=min(HTTP_WORKERS, len(pending_db))) as pool:
-                results = pool.map(_fetch_and_process, list(pending_db))
+                items = list(pending_db.items())
+                results = pool.map(lambda item: _fetch_and_process(item[1], item[0]), items)
                 for fname, success, msg in results:
                     if success:
                         processed.add(fname)
                     else:
                         logger.debug("%s : retry échoué — %s", fname, msg)
-                        still_pending.add(fname)
+                        still_pending[fname] = pending_db[fname]
             pending_db = still_pending
 
         # ── 4. Recalcul KPI, throttlé ────────────────────────────────────────────
@@ -1114,22 +1152,27 @@ def watch_loop():
             _recalculate_kpis()
             last_kpi_recalc = now
 
-        # ── 5. Nouvelles sessions ───────────────────────────────────────────────
-        sessions  = _list_sessions(SESSIONS_DIR)
+        # ── 5. Nouvelles sessions, sur tous les disques montés ──────────────────
+        disks = _active_scan_dirs()
+        seen_this_cycle: set = set()
         new_found = 0
-        for fname in sessions:
-            if fname in processed or fname in pending_stable or fname in pending_db:
-                continue
-            stat = _analysis_stat(fname)
-            if stat is None:
-                continue
-            pending_stable[fname] = (*stat, now)
-            new_found += 1
+        for d in disks:
+            for fname in _list_sessions(d["mount_path"]):
+                if fname in seen_this_cycle:
+                    continue
+                seen_this_cycle.add(fname)
+                if fname in processed or fname in pending_stable or fname in pending_db:
+                    continue
+                stat = _analysis_stat(d["mount_path"], fname)
+                if stat is None:
+                    continue
+                pending_stable[fname] = (*stat, now, d["mount_path"])
+                new_found += 1
 
         if new_found or newly_stable:
-            logger.info("Cycle : %d nouvelle(s) | %d traitée(s) | "
+            logger.info("Cycle : %d disque(s) | %d nouvelle(s) | %d traitée(s) | "
                         "en attente : %d stable, %d db",
-                        new_found, len(newly_stable),
+                        len(disks), new_found, len(newly_stable),
                         len(pending_stable), len(pending_db))
 
         time.sleep(SCAN_INTERVAL)
