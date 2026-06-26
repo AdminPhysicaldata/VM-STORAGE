@@ -367,7 +367,14 @@ def _is_valid_jsonl(path: Path) -> bool:
                 return False
             json.loads(tail_lines[-1])
         return True
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
+        # ValueError couvre json.JSONDecodeError ET UnicodeDecodeError — un
+        # fichier corrompu/tronqué peut contenir des octets qui ressemblent
+        # à un BOM UTF-16/32 et faire planter le décodage implicite de
+        # json.loads() sur des bytes, pas seulement échouer le parsing JSON.
+        # Sans ce filet, une session corrompue plante tout le process
+        # --watch en boucle (vu en prod sur un disque avec des fichiers
+        # endommagés) au lieu d'être simplement notée invalide.
         return False
 
 
@@ -379,7 +386,7 @@ def _is_valid_json(path: Path) -> bool:
         with open(path, "r", encoding="utf-8") as f:
             json.load(f)
         return True
-    except (OSError, json.JSONDecodeError):
+    except (OSError, ValueError):
         return False
 
 
@@ -1118,9 +1125,18 @@ def _fetch_and_process(base_dir: str, fname: str) -> tuple:
         except Exception:
             pass
 
-    size_bytes = _get_folder_size(base_dir, fname)
-    score, grade, errors, warnings = _evaluate_session(base, analysis, config)
-    duration_sec = _session_duration_sec(analysis)
+    try:
+        size_bytes = _get_folder_size(base_dir, fname)
+        score, grade, errors, warnings = _evaluate_session(base, analysis, config)
+        duration_sec = _session_duration_sec(analysis)
+    except Exception as exc:
+        # Filet de sécurité : une session avec des fichiers corrompus de
+        # façon inattendue (ex: jsonl illisible avec des octets piégeant le
+        # décodage UTF) ne doit jamais faire planter toute la boucle
+        # --watch (vu en prod : un seul fichier cassé tuait le process en
+        # boucle, empêchant TOUTES les sessions des AUTRES disques d'avancer).
+        logger.warning("%s : erreur inattendue pendant l'évaluation — %s", fname, exc)
+        return fname, False, f"erreur évaluation: {exc}"
 
     success, session_id, created, err = _post_scan_result(
         fname, score, grade, errors, len(warnings), size_bytes, config,
