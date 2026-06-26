@@ -645,6 +645,24 @@ def _autodiscover_disks(known_paths: set) -> list:
     return disks
 
 
+def _sessions_root(mount_path: str) -> str:
+    """
+    Beaucoup de disques (SSD comme HDD) ne stockent pas les session_* à la
+    racine du point de montage, mais dans un sous-dossier 'sessions/' à côté
+    de 'sessions_quarantine/', 'sessions_envoyee/', etc. (même arborescence
+    que SESSIONS_PATH/SESSIONS_ENVOYE_PATH/SESSIONS_QUARANTINE_PATH dans
+    .env). Si ce sous-dossier existe, c'est lui qu'il faut scanner — sinon on
+    scanne directement la racine du disque (anciens disques à plat, sessions
+    directement à la racine, ex: certains HDD historiques).
+
+    Important : sans ce détour, _list_sessions verrait le dossier littéral
+    'sessions' (et 'sessions_quarantine', 'sessions_envoyee'...) comme une
+    session à part entière, puisque leur nom commence aussi par 'session'.
+    """
+    candidate = os.path.join(mount_path, "sessions")
+    return candidate if os.path.isdir(candidate) else mount_path
+
+
 def _discover_disks() -> list:
     """Calcule total/used/free (os.statvfs) pour chaque disque configuré
     (explicite + auto-découvert) dont le mount_path existe déjà. Les disques
@@ -667,7 +685,10 @@ def _discover_disks() -> list:
         except OSError as exc:
             logger.warning("Disque %s : statvfs(%s) a échoué : %s", disk["disk_uuid"], path, exc)
             continue
-        disks.append({**disk, "total_bytes": total, "used_bytes": used, "free_bytes": free})
+        disks.append({
+            **disk, "total_bytes": total, "used_bytes": used, "free_bytes": free,
+            "sessions_root": _sessions_root(path),
+        })
     return disks
 
 
@@ -679,7 +700,7 @@ def _scan_disks() -> None:
         if not disks:
             return
         payload = [
-            {**d, "server_id": SERVER_GROUP, "folders": _list_sessions(d["mount_path"])}
+            {**d, "server_id": SERVER_GROUP, "folders": _list_sessions(d["sessions_root"])}
             for d in disks
         ]
         r = requests.post(
@@ -782,12 +803,12 @@ def run_once():
         return
 
     seen: set = set()
-    disk_folders: list = []  # [(mount_path, [folder_name, ...]), ...]
+    disk_folders: list = []  # [(sessions_root, [folder_name, ...]), ...]
     for d in disks:
-        folders = [f for f in _list_sessions(d["mount_path"]) if f not in seen]
+        folders = [f for f in _list_sessions(d["sessions_root"]) if f not in seen]
         seen.update(folders)
         if folders:
-            disk_folders.append((d["mount_path"], folders))
+            disk_folders.append((d["sessions_root"], folders))
 
     to_scan_count = len(seen)
     logger.info("Disques : %d | total dossiers : %d | mode full-rescan (aucun filtrage)",
@@ -800,10 +821,10 @@ def run_once():
     # ── Étape 2 : scan parallèle par chunks (local, sans réseau) ───────────────
     # Un chunk ne mélange jamais deux disques (sessions_dir unique par chunk).
     chunks = []
-    for mount_path, folders in disk_folders:
+    for sessions_root, folders in disk_folders:
         chunk_size = max(1, len(folders) // (SCAN_WORKERS * 4))
         for i in range(0, len(folders), chunk_size):
-            chunks.append((mount_path, folders[i:i + chunk_size]))
+            chunks.append((sessions_root, folders[i:i + chunk_size]))
     logger.info("Chunks : %d | %d processus", len(chunks), SCAN_WORKERS)
 
     ok = skipped = failed = no_analysis = 0
@@ -925,13 +946,16 @@ def _ultrafast_scan_one(base_dir: str, folder_name: str) -> tuple:
 
 
 def _ultrafast_scan_chunk(args: tuple) -> tuple:
-    """Worker process : args = (mount_path, [folder_name, ...]).
-    Retourne (mount_path, [(folder_name, duration_sec, has_analysis), ...])."""
-    mount_path, folder_names = args
+    """Worker process : args = (mount_path, sessions_root, [folder_name, ...]).
+    mount_path identifie le disque (clé d'affichage/stats), sessions_root est
+    le dossier réellement scanné (peut être <mount_path>/sessions, voir
+    _sessions_root). Retourne (mount_path, [(folder_name, duration_sec,
+    has_analysis), ...])."""
+    mount_path, sessions_root, folder_names = args
     workers = min(ULTRAFAST_THREADS_PER_WORKER, len(folder_names)) or 1
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(
-            lambda fname: _ultrafast_scan_one(mount_path, fname),
+            lambda fname: _ultrafast_scan_one(sessions_root, fname),
             folder_names,
         ))
     return mount_path, results
@@ -991,7 +1015,8 @@ def run_ultrafast():
         logger.info("Aucun disque monté trouvé. Rien à faire.")
         return
 
-    disk_folders = {d["mount_path"]: _list_sessions(d["mount_path"]) for d in disks}
+    sessions_root_by_path = {d["mount_path"]: d["sessions_root"] for d in disks}
+    disk_folders = {d["mount_path"]: _list_sessions(d["sessions_root"]) for d in disks}
     disk_type_by_path = {d["mount_path"]: d["disk_type"] for d in disks}
 
     total_sessions = sum(len(f) for f in disk_folders.values())
@@ -1010,7 +1035,7 @@ def run_ultrafast():
             continue
         chunk_size = max(1, len(folders) // (ULTRAFAST_WORKERS * 4))
         for i in range(0, len(folders), chunk_size):
-            chunks.append((mount_path, folders[i:i + chunk_size]))
+            chunks.append((mount_path, sessions_root_by_path[mount_path], folders[i:i + chunk_size]))
 
     if chunks:
         with ProcessPoolExecutor(max_workers=ULTRAFAST_WORKERS) as pool:
@@ -1157,16 +1182,16 @@ def watch_loop():
         seen_this_cycle: set = set()
         new_found = 0
         for d in disks:
-            for fname in _list_sessions(d["mount_path"]):
+            for fname in _list_sessions(d["sessions_root"]):
                 if fname in seen_this_cycle:
                     continue
                 seen_this_cycle.add(fname)
                 if fname in processed or fname in pending_stable or fname in pending_db:
                     continue
-                stat = _analysis_stat(d["mount_path"], fname)
+                stat = _analysis_stat(d["sessions_root"], fname)
                 if stat is None:
                     continue
-                pending_stable[fname] = (*stat, now, d["mount_path"])
+                pending_stable[fname] = (*stat, now, d["sessions_root"])
                 new_found += 1
 
         if new_found or newly_stable:
