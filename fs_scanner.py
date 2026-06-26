@@ -537,6 +537,13 @@ def _scan_chunk(args: tuple) -> list:
 
 # ── Utilitaires FS ─────────────────────────────────────────────────────────────
 
+# Noms de dossiers "conteneurs" (jamais des sessions individuelles), à
+# exclure même s'ils commencent par "session" — ex: une racine de disque qui
+# a un sous-dossier 'sessions/' vide à côté de session_* restées à plat
+# (voir _sessions_root) ferait sinon remonter 'sessions' comme fausse session.
+_RESERVED_SESSION_DIR_NAMES = {"sessions", "sessions_quarantine", "sessions_envoyee", "sessions_envoyes"}
+
+
 def _list_sessions(sessions_dir: str) -> list:
     """Liste les dossiers session_* via os.scandir (bien plus rapide que listdir)."""
     try:
@@ -544,6 +551,7 @@ def _list_sessions(sessions_dir: str) -> list:
             return sorted(
                 e.name for e in it
                 if e.is_dir(follow_symlinks=False) and e.name.lower().startswith("session")
+                and e.name.lower() not in _RESERVED_SESSION_DIR_NAMES
             )
     except Exception as exc:
         logger.error("Impossible de lister %s : %s", sessions_dir, exc)
@@ -658,9 +666,24 @@ def _sessions_root(mount_path: str) -> str:
     Important : sans ce détour, _list_sessions verrait le dossier littéral
     'sessions' (et 'sessions_quarantine', 'sessions_envoyee'...) comme une
     session à part entière, puisque leur nom commence aussi par 'session'.
+
+    On ne se contente pas de vérifier que 'sessions/' existe : certains
+    disques ont un sous-dossier 'sessions/' vide (créé par erreur ou en
+    prévision d'un futur rangement) alors que les session_* sont restées à
+    la racine du disque (anciens disques à plat). On vérifie donc qu'il
+    contient bien au moins une vraie session avant de l'utiliser, sinon on
+    retombe sur la racine du disque.
     """
     candidate = os.path.join(mount_path, "sessions")
-    return candidate if os.path.isdir(candidate) else mount_path
+    if os.path.isdir(candidate):
+        try:
+            with os.scandir(candidate) as it:
+                for e in it:
+                    if e.is_dir(follow_symlinks=False) and e.name.lower().startswith("session"):
+                        return candidate
+        except OSError:
+            pass
+    return mount_path
 
 
 def _discover_disks() -> list:
