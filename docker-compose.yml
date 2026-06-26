@@ -94,6 +94,13 @@ services:
       DISK_MOUNTS: ${DISK_MOUNTS:-${SESSIONS_DIR:-/data/sessions}:ssd:SSD principal:local-ssd-data}
       DISK_AUTODISCOVER_GLOB: ${DISK_AUTODISCOVER_GLOB:-/mnt/*}
       DISK_SCAN_INTERVAL: ${DISK_SCAN_INTERVAL:-300}
+      # Processus/threads du scan normal (--once/--watch) — à baisser via
+      # .env (FS_SCANNER_SCAN_WORKERS/FS_SCANNER_SCAN_THREADS) sur les
+      # machines avec peu de RAM ou des disques USB fragiles, pour éviter
+      # les OOM kill / surcharge I/O quand plusieurs gros disques sont
+      # scannés en parallèle.
+      SCAN_WORKERS: ${FS_SCANNER_SCAN_WORKERS:-4}
+      SCAN_THREADS_PER_WORKER: ${FS_SCANNER_SCAN_THREADS:-4}
       HTTP_WORKERS: ${FS_SCANNER_HTTP_WORKERS:-8}
       SERVER_GROUP: ${FS_SCANNER_SERVER_GROUP:-MADA}
       ULTRAFAST_WORKERS: ${FS_SCANNER_ULTRAFAST_WORKERS:-}
