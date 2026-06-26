@@ -45,6 +45,14 @@ Architecture --once :
   5. Bilan final : sessions scannées, heures propres, % valides / invalides
 
 Variables d'environnement :
+  STORAGE_NODE_ID         Identifiant unique de CETTE machine physique
+                          (défaut: "default"). À définir dans .env sur
+                          CHAQUE serveur storage dès qu'il y en a plus
+                          d'un — préfixe tous les disk_uuid générés
+                          automatiquement, pour qu'ils ne collisionnent
+                          jamais entre deux machines (ex: deux serveurs
+                          ayant chacun un /data/sessions ou un /mnt/hdd0
+                          écriraient sinon sur la même ligne storage_disks).
   SESSIONS_DIR            Répertoire sessions           (défaut: /data/sessions)
   SCAN_WORKERS            Processus parallèles (scan)   (défaut: nb CPUs)
   SCAN_THREADS_PER_WORKER Threads I/O par processus      (défaut: 4)
@@ -53,7 +61,7 @@ Variables d'environnement :
   SCAN_INTERVAL           Intervalle watch en s          (défaut: 15)
   DISK_MOUNTS             Disques SSD/HDD à suivre explicitement, format
                           "mount_path:type:label:disk_uuid" séparés par ';'
-                          (défaut: "<SESSIONS_DIR>:ssd:SSD principal:local-ssd-data")
+                          (défaut: "<SESSIONS_DIR>:ssd:SSD principal:<STORAGE_NODE_ID>-ssd-data")
   DISK_AUTODISCOVER_GLOB  Pattern glob de points de montage HDD à découvrir
                           automatiquement (défaut: "/mnt/*"). Chaque répertoire
                           qui est un vrai point de montage (os.path.ismount) et
@@ -100,11 +108,22 @@ STABILITY_SECONDS = int(os.environ.get("STABILITY_SECONDS", "60"))
 SCAN_INTERVAL     = int(os.environ.get("SCAN_INTERVAL", "15"))
 KPI_RECALC_INTERVAL = int(os.environ.get("KPI_RECALC_INTERVAL", "60"))
 
+# Identifiant unique de CETTE machine physique (un seul fs_scanner par
+# machine) — sert à préfixer les disk_uuid générés automatiquement
+# (DISK_MOUNTS par défaut + autodiscovery), pour qu'ils ne collisionnent
+# jamais entre deux serveurs storage différents (ex: deux machines ont
+# chacune un disque "hdd0" ou un "/data/sessions" — sans préfixe, les deux
+# écriraient sur la même ligne storage_disks, l'une écrasant l'autre).
+# À définir explicitement dans .env sur chaque serveur (ex: STORAGE_NODE_ID
+# = nom de la machine) ; "default" si absent (ok pour un seul serveur, à
+# corriger dès qu'on en ajoute un second).
+STORAGE_NODE_ID = os.environ.get("STORAGE_NODE_ID", "default")
+
 # Disques de stockage (SSD à expédier / HDD de sauvegarde) — voir _scan_disks().
 # Format : "mount_path:type:label:disk_uuid" (type = ssd|hdd), séparés par ';'.
 DISK_MOUNTS = os.environ.get(
     "DISK_MOUNTS",
-    f"{SESSIONS_DIR}:ssd:SSD principal:local-ssd-data",
+    f"{SESSIONS_DIR}:ssd:SSD principal:{STORAGE_NODE_ID}-ssd-data",
 )
 # Pattern glob de points de montage à découvrir automatiquement (nouveaux
 # disques HDD branchés/montés sans avoir à toucher la config) — voir
@@ -638,7 +657,9 @@ def _autodiscover_disks(known_paths: set) -> list:
     DISK_MOUNTS, via le pattern DISK_AUTODISCOVER_GLOB (défaut /mnt/*).
     Permet d'ajouter/retirer des disques physiques sans toucher la config :
     seuls les vrais points de montage (os.path.ismount) sont retenus, label
-    et disk_uuid sont dérivés du nom du dossier."""
+    et disk_uuid sont dérivés du nom du dossier, préfixé par STORAGE_NODE_ID
+    pour rester unique même si deux serveurs ont un disque au même nom
+    (ex: deux machines avec chacune un /mnt/hdd0)."""
     disks = []
     for path in sorted(glob.glob(DISK_AUTODISCOVER_GLOB)):
         if path in known_paths or not os.path.ismount(path):
@@ -648,7 +669,7 @@ def _autodiscover_disks(known_paths: set) -> list:
             "mount_path": path,
             "disk_type":  "hdd",
             "label":      name,
-            "disk_uuid":  f"local-{name}",
+            "disk_uuid":  f"{STORAGE_NODE_ID}-{name}",
         })
     return disks
 

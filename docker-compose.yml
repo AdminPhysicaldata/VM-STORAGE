@@ -86,12 +86,16 @@ services:
       - sessions_data:${SESSIONS_DIR:-/data/sessions}:ro
       - /mnt:/mnt:ro
     environment:
+      # Identifiant unique de CETTE machine — voir fs_scanner.py. À définir
+      # explicitement dans .env sur chaque serveur storage (sinon tous les
+      # serveurs sans cette variable collisionnent sur "default").
+      STORAGE_NODE_ID: ${STORAGE_NODE_ID:-default}
       SESSIONS_DIR: ${SESSIONS_DIR:-/data/sessions}
       BACKEND_URL: http://${VM_BACKEND_IP}:5000/api
       INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
       SCAN_INTERVAL: ${FS_SCANNER_INTERVAL:-15}
       STABILITY_SECONDS: ${FS_SCANNER_STABILITY:-60}
-      DISK_MOUNTS: ${DISK_MOUNTS:-${SESSIONS_DIR:-/data/sessions}:ssd:SSD principal:local-ssd-data}
+      DISK_MOUNTS: ${DISK_MOUNTS:-${SESSIONS_DIR:-/data/sessions}:ssd:SSD principal:${STORAGE_NODE_ID:-default}-ssd-data}
       DISK_AUTODISCOVER_GLOB: ${DISK_AUTODISCOVER_GLOB:-/mnt/*}
       DISK_SCAN_INTERVAL: ${DISK_SCAN_INTERVAL:-300}
       # Processus/threads du scan normal (--once/--watch) — à baisser via
