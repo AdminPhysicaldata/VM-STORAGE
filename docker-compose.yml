@@ -85,14 +85,6 @@ services:
     volumes:
       - sessions_data:${SESSIONS_DIR:-/data/sessions}:ro
       - /mnt:/mnt:ro
-      # Disques HDD montés hors de /mnt (ex: /disk, /disk2, /disk3, /disk4)
-      # — DISK_AUTODISCOVER_GLOB ne regarde que /mnt/*, donc on les expose
-      # ici sous /mnt/<nom> pour qu'ils soient auto-découverts sans rien
-      # configurer de plus. Ajoute une ligne par disque additionnel.
-      - /disk:/mnt/disk:ro
-      - /disk2:/mnt/disk2:ro
-      - /disk3:/mnt/disk3:ro
-      - /disk4:/mnt/disk4:ro
     environment:
       SESSIONS_DIR: ${SESSIONS_DIR:-/data/sessions}
       BACKEND_URL: http://${VM_BACKEND_IP}:5000/api
@@ -119,12 +111,6 @@ services:
     volumes:
       - sessions_data:/data/sessions:ro
       - /mnt:/mnt
-      # Mêmes disques HDD que fs-scanner, mais en lecture/écriture : ce
-      # service y copie les sessions depuis le SSD.
-      - /disk:/mnt/disk
-      - /disk2:/mnt/disk2
-      - /disk3:/mnt/disk3
-      - /disk4:/mnt/disk4
     environment:
       POSTGRES_HOST: ${VM_DATA_IP}
       POSTGRES_PORT: "5432"
