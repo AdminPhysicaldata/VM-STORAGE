@@ -7,6 +7,12 @@ BDD via le backend HTTP (vm-backend), et met à jour les KPIs. Aucun accès
 direct à PostgreSQL : tout passe par BACKEND_URL (comme
 sessions-uploader/SessionsToMistral.py).
 
+Recherche des sessions (_find_sessions) : récursive sur TOUT l'arbre de
+chaque disque, pas seulement à sa racine ou dans un sous-dossier
+'sessions/' — certains disques rangent leurs sessions dans des dossiers
+nommés à la main (ex: 'send2', 'fix'), à n'importe quelle profondeur. Voir
+la docstring de _find_sessions pour le détail des règles d'exclusion.
+
 Vérification d'intégrité (_check_files_integrity) :
   Pour chaque caméra/capteur déclaré dans config.json, vérifie la présence
   ET la validité des fichiers de capture :
@@ -538,50 +544,96 @@ def _scan_one_session(sessions_dir: str, folder_name: str) -> tuple:
         return (folder_name, None, None, None, 0, None, 0, str(exc))
 
 
-def _scan_chunk(args: tuple) -> list:
+def _scan_chunk(pairs: list) -> list:
     """
-    Worker process : traite un lot de dossiers en parallèle via un pool de
+    Worker process : traite un lot de sessions en parallèle via un pool de
     threads (les opérations sont dominées par l'I/O — lecture JSON, parcours
     des atomes mp4, lecture jsonl — donc le GIL n'est pas un goulot).
 
-    args: (sessions_dir, [folder_name, ...])
+    pairs: [(parent_dir, folder_name), ...] — chaque session porte son propre
+    dossier parent (recherche récursive, voir _find_sessions), donc un chunk
+    peut mélanger des sessions de plusieurs disques ou sous-dossiers.
     Retourne: [(folder_name, score, grade, errors, warnings_count, config,
                  duration_sec, err), ...]
     """
-    sessions_dir, folder_names = args
+    if len(pairs) == 1:
+        parent_dir, fname = pairs[0]
+        return [_scan_one_session(parent_dir, fname)]
 
-    if len(folder_names) == 1:
-        return [_scan_one_session(sessions_dir, folder_names[0])]
-
-    workers = min(SCAN_THREADS_PER_WORKER, len(folder_names))
+    workers = min(SCAN_THREADS_PER_WORKER, len(pairs))
     with ThreadPoolExecutor(max_workers=workers) as pool:
         return list(pool.map(
-            lambda fname: _scan_one_session(sessions_dir, fname),
-            folder_names,
+            lambda pair: _scan_one_session(pair[0], pair[1]),
+            pairs,
         ))
 
 
 # ── Utilitaires FS ─────────────────────────────────────────────────────────────
 
 # Noms de dossiers "conteneurs" (jamais des sessions individuelles), à
-# exclure même s'ils commencent par "session" — ex: une racine de disque qui
-# a un sous-dossier 'sessions/' vide à côté de session_* restées à plat
-# (voir _sessions_root) ferait sinon remonter 'sessions' comme fausse session.
+# exclure même s'ils commencent par "session" — ex: 'sessions/',
+# 'sessions_quarantine/', 'sessions_envoyee(s)/' sont des dossiers qu'on
+# doit PARCOURIR (les vraies sessions sont dedans) mais jamais traiter
+# eux-mêmes comme une session.
 _RESERVED_SESSION_DIR_NAMES = {"sessions", "sessions_quarantine", "sessions_envoyee", "sessions_envoyes"}
 
+# Dossiers de métadonnées système, jamais des données utiles — ignorés
+# entièrement (ni traités comme session, ni parcourus), pour ne pas
+# perdre de temps/permissions sur des trucs comme la corbeille Windows ou
+# l'index Spotlight macOS qui traînent sur des disques externes partagés.
+_SKIP_DIR_NAMES = {"lost+found", "system volume information", "$recycle.bin"}
 
-def _list_sessions(sessions_dir: str) -> list:
-    """Liste les dossiers session_* via os.scandir (bien plus rapide que listdir)."""
-    try:
-        with os.scandir(sessions_dir) as it:
-            return sorted(
-                e.name for e in it
-                if e.is_dir(follow_symlinks=False) and e.name.lower().startswith("session")
-                and e.name.lower() not in _RESERVED_SESSION_DIR_NAMES
-            )
-    except Exception as exc:
-        logger.error("Impossible de lister %s : %s", sessions_dir, exc)
-        return []
+# Profondeur max de descente lors de la recherche récursive de sessions —
+# protection contre une arborescence inattendue/un lien cyclique, pas une
+# limite qu'on s'attend à atteindre en usage normal (les sessions sont
+# trouvées en pratique à 1-2 niveaux sous la racine du disque).
+_FIND_SESSIONS_MAX_DEPTH = 6
+
+
+def _find_sessions(root: str, max_depth: int = _FIND_SESSIONS_MAX_DEPTH) -> list:
+    """
+    Recherche récursive de TOUS les dossiers session_* sous root, où qu'ils
+    soient nichés — pas seulement à la racine du disque ou dans un
+    sous-dossier 'sessions/' : certains disques rangent leurs sessions dans
+    des dossiers nommés à la main (ex: 'send2', 'fix'), à n'importe quelle
+    profondeur.
+
+    Dès qu'un dossier 'session_xxx' (hors noms réservés) est trouvé, on
+    l'ajoute SANS descendre dedans (ses sous-dossiers cameras/sensors/...
+    ne sont pas des sessions). Tout le reste est parcouru jusqu'à
+    max_depth, sauf les dossiers cachés et les noms système (voir
+    _SKIP_DIR_NAMES).
+
+    Retourne une liste de (parent_dir, folder_name) — un même folder_name
+    peut en théorie être trouvé à plusieurs endroits (disque mal rangé) ;
+    c'est à l'appelant de dédupliquer s'il y attache une identité globale
+    (voir les ensembles 'seen' dans run_once/watch_loop/run_ultrafast).
+    """
+    found = []
+    stack = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            with os.scandir(current) as it:
+                entries = list(it)
+        except OSError as exc:
+            logger.debug("Impossible de lister %s : %s", current, exc)
+            continue
+        for e in entries:
+            try:
+                if not e.is_dir(follow_symlinks=False):
+                    continue
+            except OSError:
+                continue
+            name_lower = e.name.lower()
+            if name_lower.startswith(".") or name_lower in _SKIP_DIR_NAMES:
+                continue
+            if name_lower.startswith("session") and name_lower not in _RESERVED_SESSION_DIR_NAMES:
+                found.append((current, e.name))
+                continue
+            if depth < max_depth:
+                stack.append((e.path, depth + 1))
+    return found
 
 
 def _analysis_stat(base_dir: str, folder_name: str) -> tuple | None:
@@ -681,39 +733,6 @@ def _autodiscover_disks(known_paths: set) -> list:
     return disks
 
 
-def _sessions_root(mount_path: str) -> str:
-    """
-    Beaucoup de disques (SSD comme HDD) ne stockent pas les session_* à la
-    racine du point de montage, mais dans un sous-dossier 'sessions/' à côté
-    de 'sessions_quarantine/', 'sessions_envoyee/', etc. (même arborescence
-    que SESSIONS_PATH/SESSIONS_ENVOYE_PATH/SESSIONS_QUARANTINE_PATH dans
-    .env). Si ce sous-dossier existe, c'est lui qu'il faut scanner — sinon on
-    scanne directement la racine du disque (anciens disques à plat, sessions
-    directement à la racine, ex: certains HDD historiques).
-
-    Important : sans ce détour, _list_sessions verrait le dossier littéral
-    'sessions' (et 'sessions_quarantine', 'sessions_envoyee'...) comme une
-    session à part entière, puisque leur nom commence aussi par 'session'.
-
-    On ne se contente pas de vérifier que 'sessions/' existe : certains
-    disques ont un sous-dossier 'sessions/' vide (créé par erreur ou en
-    prévision d'un futur rangement) alors que les session_* sont restées à
-    la racine du disque (anciens disques à plat). On vérifie donc qu'il
-    contient bien au moins une vraie session avant de l'utiliser, sinon on
-    retombe sur la racine du disque.
-    """
-    candidate = os.path.join(mount_path, "sessions")
-    if os.path.isdir(candidate):
-        try:
-            with os.scandir(candidate) as it:
-                for e in it:
-                    if e.is_dir(follow_symlinks=False) and e.name.lower().startswith("session"):
-                        return candidate
-        except OSError:
-            pass
-    return mount_path
-
-
 def _discover_disks() -> list:
     """Calcule total/used/free (os.statvfs) pour chaque disque configuré
     (explicite + auto-découvert) dont le mount_path existe déjà. Les disques
@@ -736,10 +755,7 @@ def _discover_disks() -> list:
         except OSError as exc:
             logger.warning("Disque %s : statvfs(%s) a échoué : %s", disk["disk_uuid"], path, exc)
             continue
-        disks.append({
-            **disk, "total_bytes": total, "used_bytes": used, "free_bytes": free,
-            "sessions_root": _sessions_root(path),
-        })
+        disks.append({**disk, "total_bytes": total, "used_bytes": used, "free_bytes": free})
     return disks
 
 
@@ -751,7 +767,8 @@ def _scan_disks() -> None:
         if not disks:
             return
         payload = [
-            {**d, "server_id": SERVER_GROUP, "folders": _list_sessions(d["sessions_root"])}
+            {**d, "server_id": SERVER_GROUP,
+             "folders": [name for _, name in _find_sessions(d["mount_path"])]}
             for d in disks
         ]
         r = requests.post(
@@ -847,21 +864,22 @@ def run_once():
 
     t0 = time.monotonic()
 
-    # ── Étape 1 : liste FS sur tous les disques montés (tout retraiter) ───────
+    # ── Étape 1 : liste FS récursive sur tous les disques montés ──────────────
     disks = _active_scan_dirs()
     if not disks:
         logger.info("Aucun disque monté trouvé. Rien à faire.")
         return
 
     seen: set = set()
-    disk_folders: list = []  # [(sessions_root, [folder_name, ...]), ...]
+    all_pairs: list = []  # [(parent_dir, folder_name), ...]
     for d in disks:
-        folders = [f for f in _list_sessions(d["sessions_root"]) if f not in seen]
-        seen.update(folders)
-        if folders:
-            disk_folders.append((d["sessions_root"], folders))
+        for parent_dir, fname in _find_sessions(d["mount_path"]):
+            if fname in seen:
+                continue
+            seen.add(fname)
+            all_pairs.append((parent_dir, fname))
 
-    to_scan_count = len(seen)
+    to_scan_count = len(all_pairs)
     logger.info("Disques : %d | total dossiers : %d | mode full-rescan (aucun filtrage)",
                 len(disks), to_scan_count)
 
@@ -870,12 +888,11 @@ def run_once():
         return
 
     # ── Étape 2 : scan parallèle par chunks (local, sans réseau) ───────────────
-    # Un chunk ne mélange jamais deux disques (sessions_dir unique par chunk).
-    chunks = []
-    for sessions_root, folders in disk_folders:
-        chunk_size = max(1, len(folders) // (SCAN_WORKERS * 4))
-        for i in range(0, len(folders), chunk_size):
-            chunks.append((sessions_root, folders[i:i + chunk_size]))
+    # Chaque paire porte son propre dossier parent (recherche récursive), donc
+    # un chunk peut librement mélanger des sessions de plusieurs disques/
+    # sous-dossiers différents.
+    chunk_size = max(1, len(all_pairs) // (SCAN_WORKERS * 4))
+    chunks = [all_pairs[i:i + chunk_size] for i in range(0, len(all_pairs), chunk_size)]
     logger.info("Chunks : %d | %d processus", len(chunks), SCAN_WORKERS)
 
     ok = skipped = failed = no_analysis = 0
@@ -997,17 +1014,17 @@ def _ultrafast_scan_one(base_dir: str, folder_name: str) -> tuple:
 
 
 def _ultrafast_scan_chunk(args: tuple) -> tuple:
-    """Worker process : args = (mount_path, sessions_root, [folder_name, ...]).
-    mount_path identifie le disque (clé d'affichage/stats), sessions_root est
-    le dossier réellement scanné (peut être <mount_path>/sessions, voir
-    _sessions_root). Retourne (mount_path, [(folder_name, duration_sec,
+    """Worker process : args = (mount_path, [(parent_dir, folder_name), ...]).
+    mount_path identifie le disque (clé d'affichage/stats) ; chaque paire
+    porte son propre dossier parent (recherche récursive, voir
+    _find_sessions). Retourne (mount_path, [(folder_name, duration_sec,
     has_analysis), ...])."""
-    mount_path, sessions_root, folder_names = args
-    workers = min(ULTRAFAST_THREADS_PER_WORKER, len(folder_names)) or 1
+    mount_path, pairs = args
+    workers = min(ULTRAFAST_THREADS_PER_WORKER, len(pairs)) or 1
     with ThreadPoolExecutor(max_workers=workers) as pool:
         results = list(pool.map(
-            lambda fname: _ultrafast_scan_one(sessions_root, fname),
-            folder_names,
+            lambda pair: _ultrafast_scan_one(pair[0], pair[1]),
+            pairs,
         ))
     return mount_path, results
 
@@ -1049,7 +1066,8 @@ def run_ultrafast():
     """
     Scan ultrafast :
       1. Découvre tous les disques (SSD + HDD, explicites + auto-découverts)
-      2. Liste les dossiers de session sur chacun (os.scandir, pas de stat)
+      2. Recherche récursive des dossiers de session sur chacun (où qu'ils
+         soient nichés, voir _find_sessions — pas de stat, juste scandir)
       3. ProcessPoolExecutor (ULTRAFAST_WORKERS) + ThreadPoolExecutor par
          processus (ULTRAFAST_THREADS_PER_WORKER) → lecture best-effort de
          analysis.json uniquement, AUCUNE validation de contenu/intégrité
@@ -1066,27 +1084,28 @@ def run_ultrafast():
         logger.info("Aucun disque monté trouvé. Rien à faire.")
         return
 
-    sessions_root_by_path = {d["mount_path"]: d["sessions_root"] for d in disks}
-    disk_folders = {d["mount_path"]: _list_sessions(d["sessions_root"]) for d in disks}
+    # disk_pairs : {mount_path: [(parent_dir, folder_name), ...]} — recherche
+    # récursive (voir _find_sessions), pas uniquement à la racine/'sessions/'.
+    disk_pairs = {d["mount_path"]: _find_sessions(d["mount_path"]) for d in disks}
     disk_type_by_path = {d["mount_path"]: d["disk_type"] for d in disks}
 
-    total_sessions = sum(len(f) for f in disk_folders.values())
+    total_sessions = sum(len(p) for p in disk_pairs.values())
     logger.info("Disques détectés : %d | sessions sur disque (total) : %d",
                 len(disks), total_sessions)
 
     stats = {
-        mp: {"sessions": len(folders), "with_analysis": 0, "duration_sec": 0.0,
+        mp: {"sessions": len(pairs), "with_analysis": 0, "duration_sec": 0.0,
              "disk_type": disk_type_by_path[mp]}
-        for mp, folders in disk_folders.items()
+        for mp, pairs in disk_pairs.items()
     }
 
     chunks = []
-    for mount_path, folders in disk_folders.items():
-        if not folders:
+    for mount_path, pairs in disk_pairs.items():
+        if not pairs:
             continue
-        chunk_size = max(1, len(folders) // (ULTRAFAST_WORKERS * 4))
-        for i in range(0, len(folders), chunk_size):
-            chunks.append((mount_path, sessions_root_by_path[mount_path], folders[i:i + chunk_size]))
+        chunk_size = max(1, len(pairs) // (ULTRAFAST_WORKERS * 4))
+        for i in range(0, len(pairs), chunk_size):
+            chunks.append((mount_path, pairs[i:i + chunk_size]))
 
     if chunks:
         with ProcessPoolExecutor(max_workers=ULTRAFAST_WORKERS) as pool:
@@ -1242,16 +1261,16 @@ def watch_loop():
         seen_this_cycle: set = set()
         new_found = 0
         for d in disks:
-            for fname in _list_sessions(d["sessions_root"]):
+            for parent_dir, fname in _find_sessions(d["mount_path"]):
                 if fname in seen_this_cycle:
                     continue
                 seen_this_cycle.add(fname)
                 if fname in processed or fname in pending_stable or fname in pending_db:
                     continue
-                stat = _analysis_stat(d["sessions_root"], fname)
+                stat = _analysis_stat(parent_dir, fname)
                 if stat is None:
                     continue
-                pending_stable[fname] = (*stat, now, d["sessions_root"])
+                pending_stable[fname] = (*stat, now, parent_dir)
                 new_found += 1
 
         if new_found or newly_stable:
