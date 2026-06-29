@@ -5,7 +5,12 @@ sync_ssd_to_hdd.py — Redondance SSD → HDD
 Pour chaque session présente sur un SSD mais sans copie HDD
 (ssd_disk_uuid IS NOT NULL AND hdd_disk_uuid IS NULL), ce script :
   1. Identifie le chemin source sur le SSD (mount_path/session_folder)
-  2. Copie vers le premier HDD disponible avec suffisamment d'espace
+  2. Copie vers redondance/session_folder, sur le premier HDD disponible
+     avec suffisamment d'espace (le sous-dossier "redondance" isole
+     physiquement la copie de secours du reste des données du disque —
+     toujours scanné normalement par fs_scanner, juste rangé à part,
+     pour qu'un HDD déplacé/fusionné avec un autre reste lisible sans
+     confusion entre original et copie)
   3. Met à jour hdd_disk_uuid en base de données
 
 Variables d'environnement :
@@ -132,7 +137,7 @@ def _copy_session(
     Retourne (ok: bool, hdd_uuid: str | None, err: str | None).
     """
     src = Path(ssd_mount) / session_folder
-    dst = Path(hdd["mount_path"]) / session_folder
+    dst = Path(hdd["mount_path"]) / "redondance" / session_folder
 
     if not src.exists():
         return False, None, f"source introuvable : {src}"
@@ -270,6 +275,108 @@ def run(dry_run: bool, limit: int | None) -> dict:
         conn.close()
 
 
+# ── Migration rétroactive (copies déjà faites à la racine du HDD) ────────────
+
+_RESERVED_DIR_NAMES = {"redondance", "sessions", "sessions_quarantine"}
+_MIGRATE_MAX_DEPTH = 6
+
+
+def _walk_session_dirs(root: str, max_depth: int = _MIGRATE_MAX_DEPTH) -> list:
+    """Trouve tous les dossiers session_* sous root, à n'importe quelle
+    profondeur (certains HDD rangent leurs sessions dans des dossiers vrac
+    comme 'sessions1T0906') — sans descendre dans 'redondance/'. Retourne
+    une liste de (parent_dir, folder_name), miroir de fs_scanner._find_sessions."""
+    found = []
+    stack = [(root, 0)]
+    while stack:
+        current, depth = stack.pop()
+        try:
+            entries = list(os.scandir(current))
+        except OSError:
+            continue
+        for e in entries:
+            if not e.is_dir(follow_symlinks=False):
+                continue
+            name_lower = e.name.lower()
+            if name_lower.startswith("."):
+                continue
+            if name_lower in _RESERVED_DIR_NAMES:
+                continue
+            if name_lower.startswith("session"):
+                found.append((current, e.name))
+                continue
+            if depth < max_depth:
+                stack.append((e.path, depth + 1))
+    return found
+
+
+def _redundant_folders(conn, hdd_uuid: str) -> set:
+    """Noms de session_folder confirmés redondants pour ce HDD (présents
+    aussi sur un SSD — voir hdd_disk_uuid/ssd_disk_uuid). Sert de liste
+    blanche : on ne déplace JAMAIS un dossier qui n'y figure pas, pour ne
+    pas rendre invisible (via _SKIP_DIR_NAMES) la seule copie existante
+    d'une session qui n'aurait pas de copie SSD."""
+    with conn.cursor() as cur:
+        cur.execute(
+            """SELECT session_folder FROM sessions
+               WHERE hdd_disk_uuid = %s AND ssd_disk_uuid IS NOT NULL
+                 AND session_folder IS NOT NULL""",
+            (hdd_uuid,),
+        )
+        return {r[0] for r in cur.fetchall()}
+
+
+def migrate_existing(dry_run: bool) -> dict:
+    """
+    Déplace les copies déjà faites par d'anciennes versions du script
+    (à <hdd_mount>/.../session_folder) vers <hdd_mount>/redondance/session_folder,
+    pour les isoler physiquement du reste des données du disque (fs_scanner
+    continue de les scanner normalement à leur nouvel emplacement — seul
+    le rangement change, pas le suivi en base).
+    Ne déplace QUE les dossiers confirmés redondants en base (voir
+    _redundant_folders) — une session présente uniquement sur ce HDD
+    (pas de ssd_disk_uuid) n'est jamais touchée.
+    Retourne {"moved": int, "skipped": int, "errors": int}.
+    """
+    conn = _pg_connect()
+    try:
+        hdds = _disk_uuid_from_db(conn, "hdd")
+        moved = skipped = errors = 0
+        for hdd in hdds:
+            mount = hdd["mount_path"]
+            if not os.path.isdir(mount):
+                continue
+            redundant = _redundant_folders(conn, hdd["disk_uuid"])
+            logger.info("%s (%s) : %d session(s) confirmée(s) redondante(s) en base",
+                        hdd["label"], mount, len(redundant))
+            for parent_dir, entry in _walk_session_dirs(mount):
+                if entry not in redundant:
+                    skipped += 1
+                    continue
+                src = Path(parent_dir) / entry
+                dst = Path(mount) / "redondance" / entry
+                if dst.exists():
+                    logger.warning("%s : existe déjà dans redondance/, source non déplacée (doublon manuel à vérifier)", entry)
+                    skipped += 1
+                    continue
+                logger.info("%s%s → %s", "[DRY-RUN] " if dry_run else "", src, dst)
+                if dry_run:
+                    moved += 1
+                    continue
+                try:
+                    dst.parent.mkdir(parents=True, exist_ok=True)
+                    shutil.move(str(src), str(dst))
+                    moved += 1
+                except Exception as exc:
+                    logger.warning("%s : déplacement échoué — %s", entry, exc)
+                    errors += 1
+        logger.info("Migration : %d déplacée(s), %d ignorée(s) [pas confirmées redondantes ou conflit], %d erreur(s)%s",
+                    moved, skipped, errors, " [DRY-RUN]" if dry_run else "")
+        return {"moved": moved, "skipped": skipped, "errors": errors}
+    finally:
+        conn.close()
+
+
 # ── Entrypoint ────────────────────────────────────────────────────────────────
 
 def main():
@@ -278,6 +385,8 @@ def main():
     parser.add_argument("--watch",    action="store_true", help="Tourne en boucle continue")
     parser.add_argument("--interval", type=int, default=300, metavar="N", help="Intervalle de boucle en secondes (défaut: 300)")
     parser.add_argument("--limit",    type=int, default=None, metavar="N", help="Nombre max de sessions par run")
+    parser.add_argument("--migrate-existing", action="store_true",
+                         help="Déplace les copies HDD déjà faites à la racine vers redondance/, puis quitte")
     args = parser.parse_args()
 
     logging.basicConfig(
@@ -287,6 +396,10 @@ def main():
 
     if args.dry_run:
         logger.info("=== MODE DRY-RUN : aucune copie, aucune modification DB ===")
+
+    if args.migrate_existing:
+        result = migrate_existing(args.dry_run)
+        sys.exit(0 if result["errors"] == 0 else 1)
 
     if args.watch:
         logger.info("=== Mode --watch | intervalle=%ds ===", args.interval)

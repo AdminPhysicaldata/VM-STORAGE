@@ -10,10 +10,12 @@ RUN apt-get update \
 # opencv-contrib-python-headless : pas de matplotlib volontairement, --plot
 # n'est utilisé qu'en debug manuel, jamais dans la boucle automatique.
 # pandas : requis par checks.py (scoring qualité fusionné depuis treatment-worker).
-RUN pip install --no-cache-dir opencv-contrib-python-headless numpy pandas
+# requests : requis par SessionsToMistral.py (import direct, --send-mistral).
+RUN pip install --no-cache-dir opencv-contrib-python-headless numpy pandas requests
 
 WORKDIR /app
 COPY post/*.py .
+COPY sessions-uploader/SessionsToMistral.py .
 COPY post/nightly_entrypoint.sh /usr/local/bin/nightly_entrypoint.sh
 RUN chmod +x /usr/local/bin/nightly_entrypoint.sh
 

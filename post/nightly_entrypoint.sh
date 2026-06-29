@@ -17,6 +17,9 @@ SKIP_LR_CHECK="${SKIP_LR_CHECK:-0}"
 SKIP_QUALITY="${SKIP_QUALITY:-0}"               # 1 = désactive le scoring qualité 0-100/A-F (checks.py)
 SKIP_QUALITY_VISION="${SKIP_QUALITY_VISION:-0}" # 1 = scoring qualité sans les checks vidéo coûteux
 KEEP_REPORTS="${KEEP_REPORTS:-30}"             # nb de rapports JSONL conservés
+SEND_MISTRAL="${SEND_MISTRAL:-0}"              # 1 = envoie à Mistral les sessions validées OK (--send-mistral)
+MISTRAL_SENT_DIR="${MISTRAL_SENT_DIR:-}"       # vide = défaut SessionsToMistral (<parent sessions>/session_envoye)
+MISTRAL_OFFLINE="${MISTRAL_OFFLINE:-0}"        # 1 = pas d'appel BACKEND_URL lors de l'envoi Mistral
 LOCK_FILE=/tmp/post_pipeline.lock
 RUN_NOW="${RUN_NOW:-0}"                        # 1 = lance un passage immédiat au démarrage (debug)
 
@@ -35,6 +38,11 @@ run_once() {
     [ "$SKIP_QUALITY" = "1" ] && args+=(--skip-quality)
     [ "$SKIP_QUALITY_VISION" = "1" ] && args+=(--skip-quality-vision)
     [ -n "$QUARANTINE_DIR" ] && args+=(--move-bad "$QUARANTINE_DIR")
+    if [ "$SEND_MISTRAL" = "1" ]; then
+        args+=(--send-mistral)
+        [ -n "$MISTRAL_SENT_DIR" ] && args+=(--mistral-sent-dir "$MISTRAL_SENT_DIR")
+        [ "$MISTRAL_OFFLINE" = "1" ] && args+=(--mistral-offline)
+    fi
 
     log "démarrage run_pipeline.py sur $SESSIONS_DIR ${args[*]}"
     # -E 99 : code de sortie dédié si le verrou est déjà pris, pour ne jamais

@@ -89,6 +89,7 @@ import glob
 import json
 import logging
 import os
+import re
 import time
 from concurrent.futures import ProcessPoolExecutor, ThreadPoolExecutor, as_completed
 from multiprocessing import cpu_count
@@ -581,6 +582,12 @@ _RESERVED_SESSION_DIR_NAMES = {"sessions", "sessions_quarantine", "sessions_envo
 # entièrement (ni traités comme session, ni parcourus), pour ne pas
 # perdre de temps/permissions sur des trucs comme la corbeille Windows ou
 # l'index Spotlight macOS qui traînent sur des disques externes partagés.
+# NB : "redondance/" (voir sync_ssd_to_hdd.py) n'est PAS dans cette liste
+# exprès — il doit rester scanné normalement (sinon le backend désassocie
+# hdd_disk_uuid pour tout ce qui "disparaît" du scan, voir storage_disks
+# /sync : clear si session_folder absent des folders rapportés). Le
+# sous-dossier ne sert qu'à isoler physiquement les copies de secours sur
+# le disque, pas à les cacher du tracking.
 _SKIP_DIR_NAMES = {"lost+found", "system volume information", "$recycle.bin"}
 
 # Profondeur max de descente lors de la recherche récursive de sessions —
@@ -628,7 +635,12 @@ def _find_sessions(root: str, max_depth: int = _FIND_SESSIONS_MAX_DEPTH) -> list
             name_lower = e.name.lower()
             if name_lower.startswith(".") or name_lower in _SKIP_DIR_NAMES:
                 continue
-            if name_lower.startswith("session") and name_lower not in _RESERVED_SESSION_DIR_NAMES:
+            # "session_" + chiffre seulement (ex: session_20260622_085319) —
+            # pas juste startswith("session"), sinon un dossier vrac nommé
+            # à la main type "sessions1T0906" est pris pour UNE session et
+            # on ne descend jamais dedans pour trouver les vraies sessions
+            # qu'il contient (bug constaté : 7801 sessions invisibles).
+            if re.match(r"^session_\d", name_lower) and name_lower not in _RESERVED_SESSION_DIR_NAMES:
                 found.append((current, e.name))
                 continue
             if depth < max_depth:

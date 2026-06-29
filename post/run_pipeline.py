@@ -101,6 +101,7 @@ import os
 import re
 import shutil
 import sys
+import tempfile
 import threading
 import time
 from collections import Counter
@@ -112,6 +113,7 @@ from pathlib import Path
 from typing import Optional
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sessions-uploader"))
 os.environ.setdefault("NAS_SESSIONS_DIR", "")
 # Le scoring qualité (checks.py → gripper_tracking.py, check #12) écrit par
 # défaut gripper_tracking.csv/gripper_correlation.json dans la session — ce
@@ -126,6 +128,7 @@ import verify_camera_sync
 import verify_integrity
 import diagnose_shuffle
 import checks  # noqa: E402 — scoring qualité (ex treatment-worker)
+import SessionsToMistral as mistral_uploader  # noqa: E402 — envoi (--send-mistral)
 
 _PIPELINE_VERSION = 8  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
@@ -221,6 +224,51 @@ def validate_mistral_structure(session_dir: Path) -> list[str]:
             issues.append(f"sensors/{name}.jsonl vide")
 
     return issues
+
+
+# ─── Envoi Mistral (--send-mistral) ───────────────────────────────────────────
+# Réutilise les fonctions de sessions-uploader/SessionsToMistral.py (zip,
+# upload, enregistrement BDD) au lieu de dupliquer cette logique : une session
+# n'est envoyée que si CE pipeline (le plus complet : sync, shuffle, charuco,
+# corrélation gripper, structure) l'a déclarée OK — le cron --max-sessions de
+# sessions-uploader sur /data/sessions ne fait que la vérification structurelle
+# légère de SessionsToMistral.validate_session et n'a pas connaissance de ces
+# anomalies.
+
+def send_session_to_mistral(session_dir: Path, sent_dir: Path, offline: bool) -> tuple[bool, str]:
+    try:
+        analysis, config, mission = mistral_uploader.read_session_metadata(session_dir, dry_run=False)
+        duration = mistral_uploader.read_duration(session_dir)
+
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            zip_path = mistral_uploader.zip_session(session_dir, Path(tmp_dir))
+            zip_size = zip_path.stat().st_size
+            ok = mistral_uploader.upload_zip_to_mistral(str(zip_path))
+            zip_path.unlink(missing_ok=True)
+
+        if not ok:
+            if not offline:
+                mistral_uploader.api_mark_send_failed_bulk([session_dir.name])
+            return False, "upload Mistral échoué"
+
+        mistral_uploader.move_session_to_sent(session_dir, sent_dir)
+
+        if not offline:
+            session_id = None
+            if analysis is not None:
+                registered = mistral_uploader.db_register_sessions_bulk([{
+                    "folder_name": session_dir.name, "analysis": analysis,
+                    "config": config, "mission": mission, "size_bytes": zip_size,
+                }])
+                session_id = registered.get(session_dir.name)
+            ref = session_id or session_dir.name
+            mistral_uploader.api_mark_sent_bulk(
+                [{"session_ref": ref, "size_bytes": zip_size, "duration_seconds": duration}]
+            )
+
+        return True, f"envoyée à Mistral ({zip_size} octets)"
+    except Exception as exc:
+        return False, f"erreur envoi Mistral : {exc!r}"
 
 
 # ─── Couche scoring qualité (checks.py, ex treatment-worker) ─────────────────
@@ -767,6 +815,9 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
         args.move_clean.mkdir(parents=True, exist_ok=True)
     if args.move_bad:
         args.move_bad.mkdir(parents=True, exist_ok=True)
+    mistral_sent_dir = (args.mistral_sent_dir or (root.parent / "session_envoye")) if args.send_mistral else None
+    if mistral_sent_dir:
+        mistral_sent_dir.mkdir(parents=True, exist_ok=True)
 
     total = len(sessions)
     label = root.name if root else (args.list.name if args.list else "sessions")
@@ -774,6 +825,7 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
     report_fh = args.report.open("w", encoding="utf-8") if args.report else None
     stats = Stats()
     moved_clean = moved_bad = move_errors = 0
+    sent_mistral = sent_mistral_errors = 0
     cached_count = 0
     stop_requested = False
     t0 = time.monotonic()
@@ -796,6 +848,24 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
             move_errors += 1
             if stdscr is None:
                 print(f"\n  [ERREUR déplacement {dest_label}] {exc}", file=sys.stderr)
+
+    def _send_mistral_done(fut, name: str):
+        """Callback de fin d'envoi Mistral : ne fait jamais planter la boucle
+        principale (réseau down, upload échoué...) — la session reste alors
+        sur place et sera retentée au prochain run (cache invalidé puisque non
+        déplacée)."""
+        nonlocal sent_mistral, sent_mistral_errors
+        try:
+            ok, msg = fut.result()
+        except Exception as exc:  # noqa: BLE001 — défense en profondeur
+            ok, msg = False, repr(exc)
+        if ok:
+            sent_mistral += 1
+        else:
+            sent_mistral_errors += 1
+        if stdscr is None:
+            tag = "OK" if ok else "ERREUR"
+            print(f"\n  [mistral/{tag}] {name} : {msg}")
 
     try:
         # Pool de threads dédié aux déplacements : soumis au fil de l'eau pendant
@@ -825,7 +895,18 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
                     report_fh.flush()
 
                 if result["status"] == "OK":
-                    if args.move_clean:
+                    if args.send_mistral and not result.get("mistral_issues"):
+                        sf = move_pool.submit(
+                            send_session_to_mistral, session_dir, mistral_sent_dir, args.mistral_offline
+                        )
+                        sf.add_done_callback(lambda f, n=session_dir.name: _send_mistral_done(f, n))
+                    elif args.send_mistral:
+                        # Structurellement "propre" pour ce pipeline, mais rejetée par les
+                        # checks façon SessionsToMistral (cf. validate_mistral_structure) —
+                        # pas envoyée, laissée sur place pour inspection.
+                        if stdscr is None:
+                            print(f"\n  [mistral/SKIP] {session_dir.name} : {result['mistral_issues']}")
+                    elif args.move_clean:
                         mv = move_pool.submit(shutil.move, str(session_dir), str(args.move_clean / session_dir.name))
                         mv.add_done_callback(lambda f: _move_done(f, "clean"))
                 elif args.move_bad:
@@ -850,10 +931,16 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
     meta = {
         "single": False, "total": total, "elapsed": elapsed, "cached_count": cached_count,
         "moved_clean": moved_clean, "moved_bad": moved_bad, "move_errors": move_errors,
+        "sent_mistral": sent_mistral, "sent_mistral_errors": sent_mistral_errors,
         "stopped_early": stop_requested, "apply": args.apply,
         "move_clean_dir": args.move_clean, "move_bad_dir": args.move_bad,
+        "send_mistral": args.send_mistral,
     }
-    exit_code = 0 if stats.status_counts.get("ANOMALY", 0) == 0 and stats.status_counts.get("ERROR", 0) == 0 else 1
+    exit_code = 0 if (
+        stats.status_counts.get("ANOMALY", 0) == 0
+        and stats.status_counts.get("ERROR", 0) == 0
+        and sent_mistral_errors == 0
+    ) else 1
     return stats, exit_code, meta
 
 
@@ -896,6 +983,10 @@ def _print_summary(stats, meta: dict, args) -> None:
         print(f"Déplacées (bad)    : {meta.get('moved_bad', 0)}")
     if meta.get("move_errors"):
         print(f"Échecs déplacement : {meta['move_errors']}")
+    if meta.get("send_mistral"):
+        print(f"Envoyées (Mistral) : {meta.get('sent_mistral', 0)}")
+        if meta.get("sent_mistral_errors"):
+            print(f"Échecs envoi       : {meta['sent_mistral_errors']}")
     if not meta.get("apply"):
         print("\n(dry-run — relancez avec --apply pour corriger réellement les noms)")
 
@@ -930,9 +1021,22 @@ def main() -> int:
                         "(tracking gripper ArUco/ChArUco, inversion labels) — garde le score "
                         "mais basé uniquement sur les métriques structurelles/flux")
     p.add_argument("--move-clean", type=Path, metavar="DEST",
-                   help="Déplacer les sessions propres dans ce répertoire")
+                   help="Déplacer les sessions propres dans ce répertoire (incompatible avec --send-mistral, "
+                        "qui déplace lui-même les sessions envoyées)")
     p.add_argument("--move-bad", type=Path, metavar="DEST",
                    help="Déplacer les sessions en anomalie/erreur dans ce répertoire")
+    p.add_argument("--send-mistral", action="store_true",
+                   help="Envoie directement à Mistral (via sessions-uploader/SessionsToMistral.py) "
+                        "chaque session validée OK par CE pipeline (et sans problème de structure "
+                        "façon SessionsToMistral, cf. --skip-quality docstring point 8). Plus strict "
+                        "que le cron sessions-uploader habituel, qui ne fait que ce dernier contrôle "
+                        "léger. Déplace la session envoyée vers --mistral-sent-dir.")
+    p.add_argument("--mistral-sent-dir", type=Path, metavar="DEST",
+                   help="Dossier où déplacer les sessions envoyées à Mistral (défaut : "
+                        "<parent du dossier de sessions>/session_envoye)")
+    p.add_argument("--mistral-offline", action="store_true",
+                   help="Avec --send-mistral : n'appelle pas BACKEND_URL (register/mark-sent/mark-send-failed), "
+                        "envoie uniquement le zip à Mistral")
     p.add_argument("-j", "--workers", type=int, default=_DEFAULT_WORKERS, metavar="N",
                    help=f"Processus parallèles (défaut : {_DEFAULT_WORKERS}, tous les cœurs)")
     p.add_argument("--force", action="store_true",
@@ -950,6 +1054,10 @@ def main() -> int:
     if not args.session and not args.list and not args.directory:
         p.print_help()
         return 1
+
+    if args.send_mistral and args.move_clean:
+        p.error("--send-mistral et --move-clean sont incompatibles (--send-mistral déplace déjà "
+                "les sessions envoyées vers --mistral-sent-dir)")
 
     use_ui = (not args.no_ui) and (not args.session) and sys.stdout.isatty()
     if use_ui:

@@ -6,6 +6,11 @@ candidats au fil de l'eau (pas de passe d'analyse complète préalable), et un
 pool de threads (UPLOAD_WORKERS) envoie les sessions valides dès qu'elles
 sont prêtes. Les sessions invalides/rejetées/vides sont persistées dans le
 fichier de dodge dès leur analyse, pour ne jamais être ré-analysées.
+
+Une session dont la date (encodée dans le nom du dossier) n'est pas celle du
+jour courant est écartée définitivement, AVANT toute analyse — jamais envoyée,
+même si elle est par ailleurs valide (cf. session_date()/filtre "jour
+courant" dans main()).
 """
 
 from __future__ import annotations
@@ -20,6 +25,7 @@ import tempfile
 import time
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
+from datetime import date, datetime
 from multiprocessing import cpu_count
 from pathlib import Path
 
@@ -506,6 +512,28 @@ def analyze_session(session_dir: Path) -> tuple[bool, str, int]:
 
 
 # ---------------------------------------------------------------------------
+# Filtre "jour courant" — n'envoie jamais une session capturée un jour
+# précédent, même si elle vient seulement d'être détectée (rig en retard,
+# resync SFTP...). Volontairement strict : une date illisible est traitée
+# comme "pas aujourd'hui", jamais comme "OK par défaut".
+# ---------------------------------------------------------------------------
+
+_SESSION_DATE_RE = re.compile(r"^session_(\d{4})(\d{2})(\d{2})_\d{6}", re.IGNORECASE)
+
+
+def session_date(name: str) -> date | None:
+    """Date encodée dans le nom du dossier (session_YYYYMMDD_HHMMSS...).
+    None si le format n'est pas reconnu ou la date invalide."""
+    m = _SESSION_DATE_RE.match(name)
+    if not m:
+        return None
+    try:
+        return date(int(m.group(1)), int(m.group(2)), int(m.group(3)))
+    except ValueError:
+        return None
+
+
+# ---------------------------------------------------------------------------
 # Analyse d'un candidat
 # ---------------------------------------------------------------------------
 
@@ -798,8 +826,29 @@ def main() -> None:
 
     candidates = [s for s in all_sessions if s.name not in already_done]
 
+    # Filtre "jour courant" — appliqué avant tout le reste (analyse, upload) :
+    # une session d'un jour précédent est écartée définitivement, jamais
+    # envoyée, même si elle est par ailleurs structurellement valide.
+    today = datetime.now().date()
+    same_day, other_day = [], []
+    for s in candidates:
+        (same_day if session_date(s.name) == today else other_day).append(s)
+
+    for s in other_day:
+        d = session_date(s.name)
+        reason = f"session du {d.isoformat()}, pas du jour courant ({today.isoformat()})" if d \
+            else "date illisible dans le nom du dossier"
+        print(f"  [{s.name}] ECARTEE (jour) — {reason}", flush=True)
+        if not dry_run:
+            mark_skipped(root, dodge, s.name, "wrong_day", reason)
+    if other_day:
+        print(flush=True)
+
+    candidates = same_day
+
     print(f"{len(all_sessions)} dossier(s) — {len(sent_names)} déjà envoyé(s), "
-          f"{len(skipped_names)} déjà écarté(s) (problème connu). "
+          f"{len(skipped_names)} déjà écarté(s) (problème connu), "
+          f"{len(other_day)} écarté(s) (jour précédent). "
           f"{len(candidates)} candidat(s) à traiter.", flush=True)
     print(flush=True)
 

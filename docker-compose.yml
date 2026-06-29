@@ -140,9 +140,11 @@ services:
     restart: always
     volumes:
       # PAS de :ro ici : ce service renomme des fichiers, écrit le cache
-      # .postcheck.json et déplace les sessions en anomalie vers la quarantaine.
+      # .postcheck.json et déplace les sessions en anomalie vers la quarantaine
+      # (et, si SEND_MISTRAL=1, les sessions envoyées vers session_envoye).
       - sessions_data:/data/sessions
       - sessions_quarantine_data:/data/sessions_quarantine
+      - sessions_envoye_data:/data/session_envoye
       - post_reports_data:/data/reports
     environment:
       TZ: ${POST_PIPELINE_TZ:-UTC}
@@ -153,6 +155,16 @@ services:
       WORKERS: ${POST_PIPELINE_WORKERS:-4}
       APPLY: ${POST_PIPELINE_APPLY:-0}
       KEEP_REPORTS: ${POST_PIPELINE_KEEP_REPORTS:-30}
+      # --send-mistral : envoie directement à Mistral les sessions validées OK
+      # par ce pipeline (cf. run_pipeline.py), au lieu de dépendre du cron
+      # sessions-uploader (validation structurelle plus légère, sur tout
+      # /data/sessions sans tenir compte des anomalies détectées ici).
+      SEND_MISTRAL: ${POST_PIPELINE_SEND_MISTRAL:-0}
+      MISTRAL_OFFLINE: ${POST_PIPELINE_MISTRAL_OFFLINE:-0}
+      BACKEND_URL: http://${VM_BACKEND_IP}:5000/api
+      INTERNAL_API_TOKEN: ${INTERNAL_API_TOKEN}
+      DELIVERY_CLIENT_ID: ${DELIVERY_CLIENT_ID:-mistral}
+      DELIVERY_CLIENT_NAME: ${DELIVERY_CLIENT_NAME:-Mistral AI}
 
   cadvisor:
     image: gcr.io/cadvisor/cadvisor:v0.50.0
