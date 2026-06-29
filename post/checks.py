@@ -29,6 +29,8 @@ Checks vision (12–13, actif si OpenCV disponible et ENABLE_VISION_CHECKS=true)
   13. gripper_label_inversion — détecte si les caméras left/right sont étiquetées à l'envers
                               en comparant le flux optique pince ↔ moitiés gauche/droite du head
 """
+from __future__ import annotations
+
 import glob
 import json
 import logging
