@@ -788,6 +788,11 @@ def main() -> None:
                              "(register/mark-sent/mark-send-failed). Le suivi des sessions "
                              "envoyées reste fait localement via le fichier de dodge. "
                              "À utiliser quand BACKEND_URL est lent/indisponible (ex. ngrok).")
+    parser.add_argument("--only", default=None, metavar="MANIFEST",
+                        help="Fichier manifeste (un nom de dossier de session par ligne) : "
+                             "n'envoie QUE ces sessions. Utilisé pour les lots validés "
+                             "(build_daily_batch.py) — désactive aussi le filtre 'jour courant', "
+                             "le lot ayant déjà été curé.")
     args = parser.parse_args()
 
     global OFFLINE
@@ -817,8 +822,31 @@ def main() -> None:
     skipped_names = {e["name"] for e in dodge["skipped"]}
     already_done  = sent_names | skipped_names
 
+    # Mode lot validé (--only) : on restreint aux sessions listées dans le
+    # manifeste et on saute le filtre "jour courant" (le lot a déjà été curé
+    # par build_daily_batch.py, qui a appliqué le filtre rig + jour en amont).
+    only_names: set[str] | None = None
+    if args.only:
+        only_path = Path(args.only)
+        if not only_path.is_file():
+            print(f"Erreur : manifeste '{only_path}' introuvable", flush=True)
+            sys.exit(1)
+        only_names = {
+            line.strip() for line in only_path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")
+        }
+        if not only_names:
+            print(f"Manifeste '{only_path}' vide — rien à envoyer", flush=True)
+            sys.exit(0)
+        print(f"Mode --only : {len(only_names)} session(s) ciblée(s) par le manifeste", flush=True)
+
     print(f"Lecture de '{root}'...", flush=True)
     all_sessions = sorted(p for p in root.iterdir() if p.is_dir() and p.name.lower().startswith("session"))
+    if only_names is not None:
+        all_sessions = [s for s in all_sessions if s.name in only_names]
+        missing = only_names - {s.name for s in all_sessions}
+        for name in sorted(missing):
+            print(f"  [{name}] ABSENTE du dossier — ignorée", flush=True)
 
     if not all_sessions:
         print(f"Aucun dossier 'session*' trouvé dans '{root}'", flush=True)
@@ -826,25 +854,28 @@ def main() -> None:
 
     candidates = [s for s in all_sessions if s.name not in already_done]
 
-    # Filtre "jour courant" — appliqué avant tout le reste (analyse, upload) :
-    # une session d'un jour précédent est écartée définitivement, jamais
-    # envoyée, même si elle est par ailleurs structurellement valide.
-    today = datetime.now().date()
-    same_day, other_day = [], []
-    for s in candidates:
-        (same_day if session_date(s.name) == today else other_day).append(s)
+    if only_names is None:
+        # Filtre "jour courant" — appliqué avant tout le reste (analyse, upload) :
+        # une session d'un jour précédent est écartée définitivement, jamais
+        # envoyée, même si elle est par ailleurs structurellement valide.
+        today = datetime.now().date()
+        same_day, other_day = [], []
+        for s in candidates:
+            (same_day if session_date(s.name) == today else other_day).append(s)
 
-    for s in other_day:
-        d = session_date(s.name)
-        reason = f"session du {d.isoformat()}, pas du jour courant ({today.isoformat()})" if d \
-            else "date illisible dans le nom du dossier"
-        print(f"  [{s.name}] ECARTEE (jour) — {reason}", flush=True)
-        if not dry_run:
-            mark_skipped(root, dodge, s.name, "wrong_day", reason)
-    if other_day:
-        print(flush=True)
+        for s in other_day:
+            d = session_date(s.name)
+            reason = f"session du {d.isoformat()}, pas du jour courant ({today.isoformat()})" if d \
+                else "date illisible dans le nom du dossier"
+            print(f"  [{s.name}] ECARTEE (jour) — {reason}", flush=True)
+            if not dry_run:
+                mark_skipped(root, dodge, s.name, "wrong_day", reason)
+        if other_day:
+            print(flush=True)
 
-    candidates = same_day
+        candidates = same_day
+    else:
+        other_day = []
 
     print(f"{len(all_sessions)} dossier(s) — {len(sent_names)} déjà envoyé(s), "
           f"{len(skipped_names)} déjà écarté(s) (problème connu), "
@@ -907,7 +938,12 @@ def main() -> None:
     total = len(candidates)
     candidates_iter = iter(candidates)
 
-    run_id = None if (dry_run or OFFLINE) else start_upload_run(total)
+    # Si UPLOAD_RUN_ID est fourni (par send_validated_batches), on l'utilise
+    # tel quel pour relier ce run au lot validé ; sinon on en crée un nouveau.
+    if dry_run or OFFLINE:
+        run_id = None
+    else:
+        run_id = os.environ.get("UPLOAD_RUN_ID") or start_upload_run(total)
     last_heartbeat_ts = time.monotonic()
 
     try:
@@ -954,7 +990,12 @@ def main() -> None:
                 submit_next_analysis()
 
             while pending:
-                done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED)
+                # timeout = intervalle de heartbeat : la boucle se réveille
+                # régulièrement même si aucun upload n'a fini, pour continuer à
+                # envoyer des heartbeats pendant les gros uploads (sinon le run
+                # est marqué "avorté" à tort côté backend).
+                done, _ = wait(pending.keys(), return_when=FIRST_COMPLETED,
+                               timeout=HEARTBEAT_INTERVAL_SECONDS)
 
                 if run_id and time.monotonic() - last_heartbeat_ts >= HEARTBEAT_INTERVAL_SECONDS:
                     send_run_progress(run_id, processed_count, len(sent_this_run), len(failed_names))

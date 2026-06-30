@@ -12,6 +12,8 @@ COPY SessionsToMistral.py .
 COPY SessionsToMail.py .
 COPY SessionsWatcher.py .
 COPY StorageHeartbeat.py .
+COPY build_daily_batch.py .
+COPY send_validated_batches.py .
 
 COPY cronjobs/crontab /etc/cron.d/sessions-uploader
 RUN chmod 0644 /etc/cron.d/sessions-uploader

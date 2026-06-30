@@ -36,11 +36,17 @@ from __future__ import annotations
 import argparse
 import functools
 import json
+import os
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
+
+# OpenCV : déprioritise GStreamer (souvent sans « source element » pour les
+# .mp4 sur ce build → « no source element for URI », cap.isOpened()==False)
+# afin de retomber sur FFMPEG. À poser AVANT le premier import cv2 du process.
+os.environ.setdefault("OPENCV_VIDEOIO_PRIORITY_GSTREAMER", "0")
 
 try:
     import cv2
