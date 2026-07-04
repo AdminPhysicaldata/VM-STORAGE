@@ -22,6 +22,7 @@ import re
 import shutil
 import sys
 import tempfile
+import threading
 import time
 import zipfile
 from concurrent.futures import FIRST_COMPLETED, ProcessPoolExecutor, ThreadPoolExecutor, wait
@@ -271,6 +272,72 @@ def api_mark_send_failed_bulk(session_refs: list[str]) -> None:
             logging.warning("  Backend erreur (mark-send-failed-bulk) [%s]: %s", r.status_code, r.text)
     except requests.RequestException as exc:
         logging.error("  Backend erreur (mark-send-failed-bulk) : %s", exc)
+
+
+def _fetch_delivered_folders(client_id: str) -> set[str] | None:
+    """
+    Ensemble des session_folder déjà livrés au client `client_id`, lu depuis
+    la BDD (source de vérité cross-disque : une session livrée depuis un autre
+    disque ou un run précédent y figure, même si son dossier est encore
+    physiquement présent ici). Permet de ne jamais ré-envoyer une session déjà
+    délivrée, indépendamment du fichier de dodge (local à un seul dossier
+    racine) et du déplacement vers session_envoye/ (local à un seul arbre).
+
+    Retourne None (et non set()) si OFFLINE ou si le backend est indisponible,
+    pour que l'appelant distingue « aucune livraison » de « statut inconnu »
+    (le cache TTL garde alors son dernier set connu au lieu de tout ré-ouvrir
+    à l'envoi).
+    """
+    if OFFLINE:
+        return None
+    try:
+        r = requests.get(
+            f"{BACKEND_URL}/pipeline/sessions/delivered-folders",
+            params={"client_id": client_id},
+            headers=_backend_headers(),
+            timeout=60,
+        )
+        if r.status_code == 200:
+            return set(r.json().get("folders") or [])
+        logging.warning("  Backend erreur (delivered-folders) [%s]: %s", r.status_code, r.text)
+    except requests.RequestException as exc:
+        logging.warning("  Backend: échec delivered-folders : %s", exc)
+    return None
+
+
+def fetch_delivered_folders(client_id: str) -> set[str]:
+    """Version fail-open (set vide si OFFLINE/backend indisponible), pour les
+    exécutions one-shot (SessionsToMistral.main, run_pipeline) : un seul appel
+    au démarrage, on préfère risquer un ré-envoi plutôt que bloquer un envoi
+    légitime faute d'avoir pu joindre la BDD."""
+    return _fetch_delivered_folders(client_id) or set()
+
+
+# Cache TTL du set des dossiers livrés, pour les services CONTINUS (ex.
+# mission-pipeline/pipeline_service.py) qui tournent en permanence : un snapshot
+# pris une seule fois deviendrait périmé (une session livrée par un AUTRE disque
+# après le démarrage ne serait pas vue). On rafraîchit donc le set toutes les
+# _DELIVERED_TTL secondes, en gardant un lookup O(1) par session. En cas
+# d'échec de rafraîchissement, on conserve le dernier set connu.
+_delivered_lock = threading.Lock()
+_delivered_cache: dict = {"folders": None, "ts": 0.0}
+_DELIVERED_TTL = float(os.environ.get("DELIVERED_FOLDERS_TTL", "120"))
+
+
+def delivered_folders_cached(client_id: str) -> set[str]:
+    """fetch_delivered_folders() mis en cache _DELIVERED_TTL secondes,
+    thread-safe — pour les services continus qui vérifient session par session."""
+    now = time.monotonic()
+    with _delivered_lock:
+        cached = _delivered_cache["folders"]
+        if cached is None or now - _delivered_cache["ts"] > _DELIVERED_TTL:
+            fresh = _fetch_delivered_folders(client_id)
+            if fresh is not None:
+                _delivered_cache["folders"] = fresh
+                _delivered_cache["ts"] = now
+            elif cached is None:
+                _delivered_cache["folders"] = set()  # rien de connu encore
+        return _delivered_cache["folders"] or set()
 
 
 # ---------------------------------------------------------------------------
@@ -821,6 +888,10 @@ def main() -> None:
     sent_names    = {e["name"] for e in dodge["sessions"]}
     skipped_names = {e["name"] for e in dodge["skipped"]}
     already_done  = sent_names | skipped_names
+    # Source de vérité cross-disque : dossiers déjà livrés à Mistral en BDD,
+    # quel que soit le disque. Traités juste après la sélection des candidats
+    # (déplacés hors du disque sans ré-upload — cf. plus bas).
+    delivered_names = fetch_delivered_folders(MISTRAL_CLIENT_ID)  # {} si OFFLINE
 
     # Mode lot validé (--only) : on restreint aux sessions listées dans le
     # manifeste et on saute le filtre "jour courant" (le lot a déjà été curé
@@ -853,6 +924,21 @@ def main() -> None:
         sys.exit(0)
 
     candidates = [s for s in all_sessions if s.name not in already_done]
+
+    # Sessions déjà livrées à Mistral depuis un autre disque (BDD) mais encore
+    # physiquement présentes ici : jamais ré-uploadées, sorties du disque sans
+    # ré-envoi. (En dry-run : signalées, ni déplacées ni marquées.)
+    if delivered_names:
+        delivered_here = [s for s in candidates if s.name in delivered_names]
+        for s in delivered_here:
+            print(f"  [{s.name}] DÉJÀ LIVRÉE à Mistral (BDD, autre disque) — déplacée sans ré-upload", flush=True)
+            if not dry_run:
+                mark_skipped(root, dodge, s.name, "already_sent_elsewhere",
+                             "delivered_at déjà renseigné en BDD pour le client mistral")
+                move_session_to_sent(s, sent_dir)
+        if delivered_here:
+            print(flush=True)
+        candidates = [s for s in candidates if s.name not in delivered_names]
 
     if only_names is None:
         # Filtre "jour courant" — appliqué avant tout le reste (analyse, upload) :

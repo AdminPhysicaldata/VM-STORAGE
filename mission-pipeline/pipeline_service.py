@@ -316,6 +316,14 @@ def _upload_job(session_dir: Path) -> dict:
     if is_empty:
         return {"session_dir": session_dir, "outcome": "empty", "detail": reason}
 
+    # Déjà livrée à Mistral depuis un autre disque (copie SSD/HDD dupliquée) :
+    # jamais ré-uploadée. delivered_folders_cached = snapshot BDD rafraîchi
+    # périodiquement (service continu → un snapshot figé deviendrait périmé),
+    # lookup O(1) par session.
+    if not mistral.OFFLINE and name in mistral.delivered_folders_cached(mistral.MISTRAL_CLIENT_ID):
+        return {"session_dir": session_dir, "outcome": "already_sent",
+                "detail": "déjà livrée à Mistral depuis un autre disque"}
+
     analysis, config, mission = mistral.read_session_metadata(session_dir, dry_run=False)
     duration = mistral.read_duration(session_dir)
 
@@ -340,6 +348,16 @@ def _handle_upload_result(res: dict) -> None:
         with dodge_lock:
             mistral.mark_skipped(SESSIONS_DIR, dodge, name, outcome, res["detail"])
         log(f"[envoi] {name} écarté définitivement ({outcome}) : {res['detail']}")
+        _incr("skipped")
+        _mark(name)
+        return
+
+    if outcome == "already_sent":
+        with dodge_lock:
+            mistral.mark_skipped(SESSIONS_DIR, dodge, name, "already_sent_elsewhere", res["detail"])
+        SENT_DIR.mkdir(parents=True, exist_ok=True)
+        mistral.move_session_to_sent(session_dir, SENT_DIR)
+        log(f"[envoi] {name} déjà livrée à Mistral (autre disque) — déplacée sans ré-upload")
         _incr("skipped")
         _mark(name)
         return

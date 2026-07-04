@@ -819,6 +819,21 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
     if mistral_sent_dir:
         mistral_sent_dir.mkdir(parents=True, exist_ok=True)
 
+    # Anti-doublon cross-disque : la BDD est la source de vérité de ce qui a
+    # déjà été livré à Mistral (le déplacement vers session_envoye/ ne protège
+    # que dans un seul arbre, le cache .postcheck.json ne suit pas les envois).
+    # On récupère une seule fois l'ensemble des dossiers déjà livrés ; toute
+    # session encore présente ici mais déjà en base ne sera jamais ré-envoyée,
+    # juste sortie du disque. Fail-open (set vide) si le backend est injoignable.
+    already_delivered: set[str] = set()
+    if args.send_mistral and not args.mistral_offline:
+        already_delivered = mistral_uploader.fetch_delivered_folders(
+            mistral_uploader.MISTRAL_CLIENT_ID
+        )
+        if stdscr is None:
+            print(f"{len(already_delivered)} session(s) déjà livrée(s) à Mistral "
+                  f"— ignorées à l'envoi, déplacées vers {mistral_sent_dir.name}")
+
     total = len(sessions)
     label = root.name if root else (args.list.name if args.list else "sessions")
 
@@ -826,6 +841,7 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
     stats = Stats()
     moved_clean = moved_bad = move_errors = 0
     sent_mistral = sent_mistral_errors = 0
+    skipped_delivered = 0
     cached_count = 0
     stop_requested = False
     t0 = time.monotonic()
@@ -867,6 +883,17 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
             tag = "OK" if ok else "ERREUR"
             print(f"\n  [mistral/{tag}] {name} : {msg}")
 
+    def _delivered_done(fut):
+        """Callback de déplacement d'une session déjà livrée (source BDD) :
+        compte le résultat sans jamais faire planter la boucle principale
+        (move_session_to_sent ne lève pas, retourne un bool)."""
+        nonlocal skipped_delivered
+        try:
+            fut.result()
+        except Exception:  # noqa: BLE001 — défense en profondeur
+            pass
+        skipped_delivered += 1
+
     try:
         # Pool de threads dédié aux déplacements : soumis au fil de l'eau pendant
         # que le ProcessPoolExecutor continue d'analyser les sessions suivantes —
@@ -894,7 +921,18 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
                     report_fh.write(json.dumps(result) + "\n")
                     report_fh.flush()
 
-                if result["status"] == "OK":
+                if args.send_mistral and session_dir.name in already_delivered:
+                    # Déjà livrée à Mistral (BDD, cross-disque) : jamais
+                    # ré-envoyée, quel que soit son statut ici — on la sort du
+                    # disque comme une vraie livraison (move_session_to_sent
+                    # gère un dossier de destination déjà existant).
+                    mv = move_pool.submit(
+                        mistral_uploader.move_session_to_sent, session_dir, mistral_sent_dir
+                    )
+                    mv.add_done_callback(lambda f: _delivered_done(f))
+                    if stdscr is None:
+                        print(f"\n  [mistral/DÉJÀ-LIVRÉ] {session_dir.name} : ignorée (déjà en BDD), déplacée")
+                elif result["status"] == "OK":
                     if args.send_mistral and not result.get("mistral_issues"):
                         sf = move_pool.submit(
                             send_session_to_mistral, session_dir, mistral_sent_dir, args.mistral_offline
@@ -932,6 +970,7 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
         "single": False, "total": total, "elapsed": elapsed, "cached_count": cached_count,
         "moved_clean": moved_clean, "moved_bad": moved_bad, "move_errors": move_errors,
         "sent_mistral": sent_mistral, "sent_mistral_errors": sent_mistral_errors,
+        "skipped_delivered": skipped_delivered,
         "stopped_early": stop_requested, "apply": args.apply,
         "move_clean_dir": args.move_clean, "move_bad_dir": args.move_bad,
         "send_mistral": args.send_mistral,
@@ -985,6 +1024,8 @@ def _print_summary(stats, meta: dict, args) -> None:
         print(f"Échecs déplacement : {meta['move_errors']}")
     if meta.get("send_mistral"):
         print(f"Envoyées (Mistral) : {meta.get('sent_mistral', 0)}")
+        if meta.get("skipped_delivered"):
+            print(f"Déjà livrées (skip): {meta['skipped_delivered']}")
         if meta.get("sent_mistral_errors"):
             print(f"Échecs envoi       : {meta['sent_mistral_errors']}")
     if not meta.get("apply"):
