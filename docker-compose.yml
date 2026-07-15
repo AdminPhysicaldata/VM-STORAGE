@@ -154,6 +154,12 @@ services:
       RUN_AT: ${POST_PIPELINE_RUN_AT:-03:00}
       WORKERS: ${POST_PIPELINE_WORKERS:-4}
       APPLY: ${POST_PIPELINE_APPLY:-0}
+      # --charuco-one-per-rig-hour : n'analyse le charuco que d'UNE session par
+      # poste et par heure (le placement des caméras d'un poste ne change pas
+      # au sein d'une heure) — réduit fortement le coût vidéo du run nocturne.
+      # Fail-safe : une anomalie sur la session analysée ré-active le charuco
+      # sur tout son groupe (cf. post/run_pipeline.py).
+      CHARUCO_ONE_PER_RIG_HOUR: ${POST_PIPELINE_CHARUCO_ONE_PER_RIG_HOUR:-1}
       KEEP_REPORTS: ${POST_PIPELINE_KEEP_REPORTS:-30}
       # --send-mistral : envoie directement à Mistral les sessions validées OK
       # par ce pipeline (cf. run_pipeline.py), au lieu de dépendre du cron

@@ -22,6 +22,10 @@ Chaîne, pour chaque session, les contrôles dans cet ordre :
                            "ambiguous" (zone grise, fréquent sur vidéo basse
                            résolution/floue) n'est PAS bloquant — seul un
                            "mismatch" net ou une vidéo illisible le sont.
+                           --charuco-one-per-rig-hour n'exécute cette étape
+                           (coûteuse : décodage vidéo) que sur UNE session par
+                           (poste, heure) — cf. _charuco_group_key ; si elle
+                           révèle une anomalie, tout son groupe est ré-analysé.
   6. detect_gripper_lr_marker_distance — tranche ce que l'étape 5 ne peut pas :
                            corrèle la distance des marqueurs 244/255 à
                            Opening_width (sensors/) pour confirmer que
@@ -92,6 +96,11 @@ Usage :
 
     # Sauter le scoring qualité (post/ seul, comportement historique)
     python3 run_pipeline.py /media/qbee/T9/sessions/ --skip-quality
+
+    # Run nocturne économe : charuco sur une seule session par poste et par heure,
+    # quarantaine + envoi Mistral direct des sessions OK
+    python3 run_pipeline.py /data/sessions --apply --charuco-one-per-rig-hour \\
+        --move-bad /data/sessions_quarantine --send-mistral --no-ui
 """
 from __future__ import annotations
 
@@ -130,7 +139,7 @@ import diagnose_shuffle
 import checks  # noqa: E402 — scoring qualité (ex treatment-worker)
 import SessionsToMistral as mistral_uploader  # noqa: E402 — envoi (--send-mistral)
 
-_PIPELINE_VERSION = 8  # bump à chaque changement de sémantique pour invalider le cache existant
+_PIPELINE_VERSION = 9  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
 _DEFAULT_WORKERS = os.cpu_count() or 4
 _PROGRESS_EVERY = 200
@@ -378,7 +387,7 @@ def _load_cache(session_dir: Path, fingerprint: str, config_key: str) -> dict | 
 
 def _save_cache(session_dir: Path, fingerprint: str, config_key: str, status: str,
                  lines: list[str], score: float, grade: str, criteria: dict,
-                 mistral_issues: list[str]) -> None:
+                 mistral_issues: list[str], charuco_anomaly: bool) -> None:
     marker = session_dir / _MARKER_NAME
     try:
         marker.write_text(json.dumps({
@@ -390,10 +399,50 @@ def _save_cache(session_dir: Path, fingerprint: str, config_key: str, status: st
             "grade": grade,
             "criteria": criteria,
             "mistral_issues": mistral_issues,
+            "charuco_anomaly": charuco_anomaly,
             "checked_at": datetime.now(timezone.utc).isoformat(),
         }), encoding="utf-8")
     except OSError:
         pass  # un cache qu'on n'arrive pas à écrire n'est pas bloquant
+
+
+# ─── Échantillonnage charuco par (poste, heure) ──────────────────────────────
+# Clé de groupe pour --charuco-one-per-rig-hour : le placement physique des
+# caméras d'un poste ne change pas d'une session à l'autre au sein d'une même
+# heure, donc vérifier le charuco d'UNE session par (poste, heure) suffit à
+# détecter un câblage/placement incorrect — les autres sessions du groupe
+# sautent cette étape coûteuse (décodage vidéo). Fail-safe : poste ou heure
+# indéterminable → None, la session n'est jamais échantillonnée (charuco
+# systématique).
+
+_SESSION_NAME_RE = re.compile(r"^session_(\d{8})_(\d{2})\d{4}", re.IGNORECASE)
+
+
+def _charuco_group_key(session_dir: Path) -> tuple[str, str, str] | None:
+    m = _SESSION_NAME_RE.match(session_dir.name)
+    if not m:
+        return None
+    day, hour = m.group(1), m.group(2)
+
+    cfg = _read_json_safe(str(session_dir / "config.json"))
+    rig_id = str(((cfg.get("rig") or {}).get("rig_id")) or "").strip()
+    m_rig = re.search(r"(\d+)", rig_id)
+    rig_num = int(m_rig.group(1)) if m_rig else None
+
+    # 'rig_1' est aussi le placeholder par défaut du logiciel de capture (cf.
+    # SessionsToMistral.fix_rig_config) : il peut cacher n'importe quel poste,
+    # donc on ne s'y fie que si le poste déduit de l'opérateur (règle
+    # operator_id ±30) le confirme. Un rig absent/placeholder sans opérateur
+    # exploitable reste indéterminé — jamais échantillonné.
+    if rig_num == 1:
+        rig_num = None
+    if rig_num is None:
+        expected = mistral_uploader._expected_rig_num((cfg.get("operator") or {}).get("operator_id"))
+        if expected is not None:
+            rig_num = expected
+    if rig_num is None:
+        return None
+    return (f"rig_{rig_num}", day, hour)
 
 
 # ─── Traitement d'une session (fonction top-level → picklable pour le pool) ──
@@ -434,6 +483,7 @@ def _process_one(
                 "name": name, "status": cached["status"], "lines": cached["lines"], "cached": True,
                 "score": cached.get("score", 0.0), "grade": cached.get("grade", "F"),
                 "criteria": cached.get("criteria", {}), "mistral_issues": cached.get("mistral_issues", []),
+                "charuco_anomaly": cached.get("charuco_anomaly", False),
             }
 
         lines: list[str] = []
@@ -476,6 +526,7 @@ def _process_one(
             # ici, contrairement à is_contaminated (qui ne se déclenche qu'à HIGH, ≥2 signaux).
             is_clean = is_clean and not shuffle_report.findings
 
+        charuco_anomaly = False
         if run_charuco and (session_dir / "cameras").is_dir():
             import detect_charuco_lr  # importé seulement si nécessaire (évite la dépendance opencv sinon)
             findings = detect_charuco_lr.analyze_session(session_dir, sample_fps=charuco_sample_fps)
@@ -568,16 +619,18 @@ def _process_one(
             lines.append(f"[structure] {issue}")
 
         status = "OK" if is_clean else "ANOMALY"
-        _save_cache(session_dir, fingerprint, config_key, status, lines, score, grade, criteria, mistral_issues)
+        _save_cache(session_dir, fingerprint, config_key, status, lines, score, grade, criteria,
+                    mistral_issues, charuco_anomaly)
         return {
             "name": name, "status": status, "lines": lines, "cached": False,
             "score": score, "grade": grade, "criteria": criteria, "mistral_issues": mistral_issues,
+            "charuco_anomaly": charuco_anomaly,
         }
 
     except Exception as exc:  # noqa: BLE001 — défense en profondeur, jamais de crash du pool
         return {
             "name": name, "status": "ERROR", "lines": [f"[erreur interne] {exc!r}"], "cached": False,
-            "score": 0.0, "grade": "F", "criteria": {}, "mistral_issues": [],
+            "score": 0.0, "grade": "F", "criteria": {}, "mistral_issues": [], "charuco_anomaly": False,
         }
 
 
@@ -834,6 +887,32 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
             print(f"{len(already_delivered)} session(s) déjà livrée(s) à Mistral "
                   f"— ignorées à l'envoi, déplacées vers {mistral_sent_dir.name}")
 
+    # ── Échantillonnage charuco « une session par (poste, heure) » ────────────
+    # charuco_reps : représentant de chaque groupe (la première session, ordre
+    # chronologique) — seul à porter l'analyse charuco en phase 1. Le verdict
+    # du représentant décide du sort des membres (charuco_skip) en phase 2 :
+    # groupe sain → analysés sans charuco ; représentant en anomalie charuco
+    # (ou ERROR, donc sans verdict fiable) → tout le groupe repasse au charuco
+    # complet. Sessions au poste/heure indéterminable : hors échantillonnage,
+    # charuco systématique.
+    charuco_reps: dict[str, tuple] = {}
+    charuco_skip: dict[str, tuple] = {}
+    if run_charuco and args.charuco_one_per_rig_hour:
+        groups: dict[tuple, list[Path]] = {}
+        for s in sessions:
+            key = _charuco_group_key(s)
+            if key is not None:
+                groups.setdefault(key, []).append(s)
+        for key, members in groups.items():
+            members.sort()
+            charuco_reps[str(members[0])] = key
+            for member in members[1:]:
+                charuco_skip[str(member)] = key
+        if stdscr is None:
+            print(f"Échantillonnage charuco : {len(groups)} groupe(s) (poste, heure) — "
+                  f"{len(sessions) - len(charuco_skip)} session(s) analysée(s) avec charuco, "
+                  f"{len(charuco_skip)} échantillonnée(s)")
+
     total = len(sessions)
     label = root.name if root else (args.list.name if args.list else "sessions")
 
@@ -843,6 +922,7 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
     sent_mistral = sent_mistral_errors = 0
     skipped_delivered = 0
     cached_count = 0
+    charuco_sampled_out = charuco_escalated = 0
     stop_requested = False
     t0 = time.monotonic()
 
@@ -901,17 +981,16 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
         # pas seulement à la toute fin du run (visible en direct dans le dossier).
         with ProcessPoolExecutor(max_workers=args.workers, initializer=_init_worker) as pool, \
              ThreadPoolExecutor(max_workers=max(2, args.workers // 2)) as move_pool:
-            futures = {
-                pool.submit(
-                    _process_one, str(s), args.apply, run_charuco,
+
+            def _submit(s: Path, charuco_this_session: bool):
+                return pool.submit(
+                    _process_one, str(s), args.apply, charuco_this_session,
                     args.charuco_sample_fps, args.force,
                     run_lr_check, args.lr_n_samples, run_quality,
-                ): s
-                for s in sessions
-            }
-            for fut in as_completed(futures):
-                session_dir = futures[fut]
-                result = fut.result()  # _process_one ne lève jamais : pas de try/except requis ici
+                )
+
+            def _handle_result(session_dir: Path, result: dict) -> None:
+                nonlocal cached_count
                 stats.add(result)
                 if result.get("cached"):
                     cached_count += 1
@@ -951,12 +1030,49 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
                     mv = move_pool.submit(shutil.move, str(session_dir), str(args.move_bad / session_dir.name))
                     mv.add_done_callback(lambda f: _move_done(f, "bad"))
 
+            # Phase 1 : représentants charuco + sessions hors échantillonnage
+            # (sans --charuco-one-per-rig-hour : toutes les sessions, comme avant).
+            group_anomaly: dict[tuple, bool] = {}
+            futures = {_submit(s, run_charuco): s for s in sessions if str(s) not in charuco_skip}
+            for fut in as_completed(futures):
+                session_dir = futures[fut]
+                result = fut.result()  # _process_one ne lève jamais : pas de try/except requis ici
+                key = charuco_reps.get(str(session_dir))
+                if key is not None:
+                    group_anomaly[key] = bool(result.get("charuco_anomaly")) or result["status"] == "ERROR"
+                _handle_result(session_dir, result)
+
                 reporter.update(stats)
 
                 if reporter.quit_requested():
                     stop_requested = True
                     pool.shutdown(wait=False, cancel_futures=True)
                     break
+
+            # Phase 2 : membres échantillonnés — sans charuco si leur groupe est
+            # sain, avec charuco complet si le représentant a révélé une anomalie.
+            if charuco_skip and not stop_requested:
+                futures = {}
+                for s in sessions:
+                    key = charuco_skip.get(str(s))
+                    if key is None:
+                        continue
+                    escalate = group_anomaly.get(key, True)  # représentant sans verdict → fail-safe
+                    if escalate:
+                        charuco_escalated += 1
+                    else:
+                        charuco_sampled_out += 1
+                    futures[_submit(s, escalate)] = s
+                for fut in as_completed(futures):
+                    session_dir = futures[fut]
+                    _handle_result(session_dir, fut.result())
+
+                    reporter.update(stats)
+
+                    if reporter.quit_requested():
+                        stop_requested = True
+                        pool.shutdown(wait=False, cancel_futures=True)
+                        break
             # move_pool se ferme ici (context manager) : attend que tous les
             # déplacements en attente se terminent avant de continuer.
     finally:
@@ -974,6 +1090,8 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
         "stopped_early": stop_requested, "apply": args.apply,
         "move_clean_dir": args.move_clean, "move_bad_dir": args.move_bad,
         "send_mistral": args.send_mistral,
+        "charuco_sampling": run_charuco and args.charuco_one_per_rig_hour,
+        "charuco_sampled_out": charuco_sampled_out, "charuco_escalated": charuco_escalated,
     }
     exit_code = 0 if (
         stats.status_counts.get("ANOMALY", 0) == 0
@@ -1016,6 +1134,11 @@ def _print_summary(stats, meta: dict, args) -> None:
         print("Problèmes les plus fréquents  :")
         for name, cnt in stats.top_issues(15):
             print(f"  {name:<28} {cnt}")
+    if meta.get("charuco_sampling"):
+        line = f"Charuco échantillonné : {meta.get('charuco_sampled_out', 0)} session(s) sans analyse charuco"
+        if meta.get("charuco_escalated"):
+            line += f", {meta['charuco_escalated']} ré-analysée(s) avec charuco (groupe en anomalie)"
+        print(line)
     if meta.get("move_clean_dir"):
         print(f"Déplacées (clean)  : {meta.get('moved_clean', 0)}")
     if meta.get("move_bad_dir"):
@@ -1051,6 +1174,13 @@ def main() -> int:
                    help="Sauter l'étape charuco (coûteuse, nécessite opencv)")
     p.add_argument("--charuco-sample-fps", type=float, default=2.0,
                    help="Fréquence (Hz) d'échantillonnage vidéo de detect_charuco_lr (défaut : 2.0)")
+    p.add_argument("--charuco-one-per-rig-hour", action="store_true",
+                   help="N'exécute l'étape charuco (coûteuse : décodage vidéo) que sur UNE session "
+                        "par poste (rig) et par heure — la première du groupe, ordre chronologique. "
+                        "Les autres sessions du groupe la sautent, SAUF si le représentant révèle "
+                        "une anomalie charuco : le groupe entier est alors ré-analysé avec charuco. "
+                        "Une session au poste ou à l'heure indéterminable n'est jamais échantillonnée. "
+                        "Sans effet avec --skip-charuco.")
     p.add_argument("--skip-lr-check", action="store_true",
                    help="Sauter la vérification left/right (corrélation marqueurs 244/255 ↔ Opening_width, nécessite opencv)")
     p.add_argument("--lr-n-samples", type=int, default=10, metavar="N",

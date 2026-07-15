@@ -226,6 +226,7 @@ def main() -> None:
         raise SystemExit(f"Dossier de sessions introuvable : {sessions_dir}")
 
     target = _parse_target_date(args.date)
+    batch_date = target
     rig_id = f"rig_{args.rig_num:02d}"
     max_bytes = int(args.max_gb * 1024 ** 3)
 
@@ -252,14 +253,14 @@ def main() -> None:
 
     copy_path = None
     if not args.no_copy:
-        copy_root = Path(args.copy_dir) / f"batch_{target.isoformat()}_{rig_id}"
+        copy_root = Path(args.copy_dir) / f"batch_{batch_date.isoformat()}_{rig_id}"
         logger.info("Copie de la session vers %s ...", copy_root)
         copy_batch(sessions_dir, selected, copy_root)
         copy_path = str(copy_root)
 
     if not args.no_register:
         try:
-            res = register_batch(target, rig_id, copy_path, selected)
+            res = register_batch(batch_date, rig_id, copy_path, selected)
             logger.info("Lot enregistré : %s", res.get("batch_id"))
         except Exception as exc:
             logger.error("Échec d'enregistrement backend : %s", exc)

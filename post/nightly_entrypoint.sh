@@ -13,6 +13,7 @@ WORKERS="${WORKERS:-4}"
 RUN_AT="${RUN_AT:-03:00}"                      # HH:MM, heure locale du conteneur (TZ)
 APPLY="${APPLY:-0}"                            # 0 = dry-run (recommandé), 1 = --apply réel
 SKIP_CHARUCO="${SKIP_CHARUCO:-0}"
+CHARUCO_ONE_PER_RIG_HOUR="${CHARUCO_ONE_PER_RIG_HOUR:-0}" # 1 = charuco sur UNE session par (poste, heure) seulement
 SKIP_LR_CHECK="${SKIP_LR_CHECK:-0}"
 SKIP_QUALITY="${SKIP_QUALITY:-0}"               # 1 = désactive le scoring qualité 0-100/A-F (checks.py)
 SKIP_QUALITY_VISION="${SKIP_QUALITY_VISION:-0}" # 1 = scoring qualité sans les checks vidéo coûteux
@@ -34,6 +35,7 @@ run_once() {
     args=(-j "$WORKERS" --report "$report" --no-ui)
     [ "$APPLY" = "1" ] && args+=(--apply)
     [ "$SKIP_CHARUCO" = "1" ] && args+=(--skip-charuco)
+    [ "$CHARUCO_ONE_PER_RIG_HOUR" = "1" ] && args+=(--charuco-one-per-rig-hour)
     [ "$SKIP_LR_CHECK" = "1" ] && args+=(--skip-lr-check)
     [ "$SKIP_QUALITY" = "1" ] && args+=(--skip-quality)
     [ "$SKIP_QUALITY_VISION" = "1" ] && args+=(--skip-quality-vision)
