@@ -1,0 +1,5 @@
+sudo python3 run_pipeline.py /data/sessions \
+    --apply --skip-charuco --skip-lr-check \
+    --send-mistral \
+    --mistral-sent-dir /data/session_envoye/ \
+    --move-bad /data/sessions_quarantine --no-ui

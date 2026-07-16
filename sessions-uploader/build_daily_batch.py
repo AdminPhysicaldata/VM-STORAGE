@@ -19,6 +19,13 @@ Identification du rig : robuste au format (rig_06 / RIG-6 / rig_6) — on
 compare la partie numérique de config["rig"]["rig_id"] (ou ["code"]) au numéro
 demandé.
 
+Conçu pour être relancé PLUSIEURS FOIS dans la journée (cron toutes les 30 min
+en matinée) : la synchro capture→serveur ayant des heures de retard, un seul
+passage matinal rate les sessions du jour. Chaque relance fait grossir le lot
+en attente (POST /batches idempotent) ; un lot rejeté sur /batch n'est jamais
+reconstruit automatiquement, un lot validé/envoyé n'est jamais touché, et une
+sélection inchangée n'est pas ré-enregistrée (pas de re-notification).
+
 Usage :
     python3 build_daily_batch.py
     python3 build_daily_batch.py --rig-num 6 --date yesterday --max-gb 5
@@ -203,6 +210,25 @@ def register_batch(batch_date: date, rig_id: str, copy_path: str | None,
     return r.json()
 
 
+def fetch_existing_batch(batch_id: str) -> dict | None:
+    """
+    Lot déjà enregistré pour ce (jour, rig), avec sa liste de sessions.
+    None si aucun lot, ou si le backend est injoignable (fail-open : le build
+    continue alors comme si le lot n'existait pas — le POST /batches est de
+    toute façon idempotent et refuse d'écraser un lot déjà engagé).
+    """
+    try:
+        r = requests.get(f"{BACKEND_URL}/pipeline/batches/{batch_id}",
+                         headers=_backend_headers(), timeout=30)
+        if r.status_code == 404:
+            return None
+        r.raise_for_status()
+        return r.json().get("batch")
+    except requests.RequestException as exc:
+        logger.warning("Impossible de lire l'état du lot %s (%s) — on continue sans.", batch_id, exc)
+        return None
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Construit le lot journalier d'un rig pour validation")
     parser.add_argument("--sessions-dir", default=SESSIONS_DIR)
@@ -219,6 +245,10 @@ def main() -> None:
     parser.add_argument("--no-validate", action="store_true", help="Ne pas valider l'intégrité (plus rapide)")
     parser.add_argument("--no-register", action="store_true", help="Ne pas enregistrer côté backend")
     parser.add_argument("--dry-run", action="store_true", help="N'écrit/copie/enregistre rien")
+    parser.add_argument("--force", action="store_true",
+                        help="Reconstruit/remplace le lot même s'il a été rejeté sur /batch ou que la "
+                             "sélection est inchangée (le backend refuse de toute façon d'écraser un "
+                             "lot validé/en cours d'envoi/envoyé)")
     args = parser.parse_args()
 
     sessions_dir = Path(args.sessions_dir)
@@ -229,6 +259,26 @@ def main() -> None:
     batch_date = target
     rig_id = f"rig_{args.rig_num:02d}"
     max_bytes = int(args.max_gb * 1024 ** 3)
+    batch_id = f"batch_{batch_date.isoformat()}_{rig_id}"
+
+    # Le cron relance ce build plusieurs fois dans la journée (la synchro
+    # capture→serveur a plusieurs heures de retard : à 9h30 les sessions du
+    # matin ne sont pas encore arrivées). Chaque relance fait GROSSIR le lot
+    # en attente (POST idempotent : remplace tant que pending_validation),
+    # mais ne doit JAMAIS : (a) ressusciter un lot rejeté par l'utilisateur,
+    # (b) toucher un lot validé/en cours d'envoi/envoyé, (c) ré-enregistrer
+    # (et donc re-notifier) un lot dont la sélection n'a pas changé.
+    existing = None
+    if not args.dry_run and not args.no_register and not args.force:
+        existing = fetch_existing_batch(batch_id)
+        status = (existing or {}).get("status")
+        if existing and status == "rejected":
+            logger.info("Lot %s déjà REJETÉ sur /batch — pas de reconstruction automatique "
+                        "(relancer avec --force pour proposer un nouveau lot).", batch_id)
+            sys.exit(0)
+        if existing and status != "pending_validation":
+            logger.info("Lot %s déjà au statut '%s' — rien à faire.", batch_id, status)
+            sys.exit(0)
 
     logger.info("Construction du lot %s pour %s (plafond %.1f Go, heures %dh–%dh) dans %s",
                 target.isoformat(), rig_id, args.max_gb, args.start_hour, args.end_hour, sessions_dir)
@@ -244,6 +294,14 @@ def main() -> None:
 
     total = sum(s["size_bytes"] for s in selected)
     logger.info("=== Lot %s : %d session(s), %s ===", rig_id, len(selected), format_size(total))
+
+    if existing is not None:
+        old_names = sorted(s.get("folder_name") for s in existing.get("sessions") or [])
+        new_names = sorted(s["folder_name"] for s in selected)
+        if old_names == new_names:
+            logger.info("Sélection identique au lot %s déjà en attente (%d session(s)) — "
+                        "pas de ré-enregistrement.", batch_id, len(new_names))
+            sys.exit(0)
 
     if args.dry_run:
         for s in selected:
@@ -262,6 +320,16 @@ def main() -> None:
         try:
             res = register_batch(batch_date, rig_id, copy_path, selected)
             logger.info("Lot enregistré : %s", res.get("batch_id"))
+        except requests.HTTPError as exc:
+            # 409 = lot validé/en cours d'envoi entre notre lecture et le POST
+            # (ex. l'utilisateur a cliqué Valider pendant le build) — pas une
+            # erreur : le lot du jour existe et suit son cours.
+            if exc.response is not None and exc.response.status_code == 409:
+                logger.info("Lot %s déjà engagé côté backend — pas de remplacement (%s).",
+                            batch_id, (exc.response.text or "")[:200].strip())
+                sys.exit(0)
+            logger.error("Échec d'enregistrement backend : %s", exc)
+            sys.exit(1)
         except Exception as exc:
             logger.error("Échec d'enregistrement backend : %s", exc)
             sys.exit(1)
