@@ -1157,7 +1157,10 @@ def _print_summary(stats, meta: dict, args) -> None:
 
 # ─── Point d'entrée ───────────────────────────────────────────────────────────
 
-def main() -> int:
+def build_parser() -> argparse.ArgumentParser:
+    """Parser CLI du pipeline — exposé séparément pour speed_test.py, qui doit
+    accepter EXACTEMENT les mêmes options que run_pipeline.py (parser partagé,
+    donc aucune dérive possible entre les deux scripts)."""
     p = argparse.ArgumentParser(
         description=__doc__,
         formatter_class=argparse.RawDescriptionHelpFormatter,
@@ -1220,6 +1223,11 @@ def main() -> int:
                    help="Désactive le tableau de bord ASCII (curses), force le mode texte simple "
                         "(utile pour cron/Docker/--report/sortie redirigée)")
     p.add_argument("-v", "--verbose", action="store_true", help="Afficher aussi les sessions sans anomalie (mode texte)")
+    return p
+
+
+def main() -> int:
+    p = build_parser()
     args = p.parse_args()
 
     if not args.session and not args.list and not args.directory:
