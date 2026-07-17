@@ -14,6 +14,11 @@ Garanties :
   - LECTURE SEULE sur les sessions : --apply est ignoré (dry-run forcé),
     aucun déplacement (--move-*), aucun envoi Mistral réel (--send-mistral ne
     fait que chronométrer la création du zip, dans un dossier temporaire).
+  - LECTURE SEULE sur le backend BDD : sans --mistral-offline, le speed-test
+    mesure réellement le GET delivered-folders (comme le pipeline au
+    démarrage) et sonde la latence du backend, mais n'exécute JAMAIS les
+    écritures (register-bulk / mark-sent-bulk / mark-send-failed-bulk) —
+    leur coût par session est estimé à 2 × latence mesurée.
   - N'écrit jamais .postcheck.json — le cache du vrai pipeline reste intact.
   - Seuls fichiers créés : les fichiers temporaires de bench (écriture
     disque, zip), supprimés immédiatement après mesure.
@@ -105,6 +110,9 @@ _SUGGESTIONS = {
     "structure":   "étape légère (stat + json) — rien à régler",
     "zip":         "compression zip — tourne dans le pool de déplacement (max(2, workers//2) threads) ; "
                    "augmenter -j augmente aussi ce pool",
+    "bdd":         "2 POST BDD (register-bulk + mark-sent-bulk) sérialisés par session envoyée — "
+                   "latence backend dominante : rapprocher le backend (IP directe plutôt que tunnel ngrok) "
+                   "ou regrouper les envois en vrais lots bulk",
 }
 
 
@@ -390,6 +398,34 @@ def main() -> int:
             write_results.append((label, mbps))
             print(f"    Écriture ({label:<18}) : {_fmt_rate(mbps)}")
 
+    # ── Backend BDD (--send-mistral sans --mistral-offline) ──────────────────
+    # Lecture seule : on mesure le GET delivered-folders réel (exactement
+    # l'appel que fait run_pipeline au démarrage) et la latence du backend via
+    # des GET à vide. Les écritures (register-bulk, mark-sent-bulk) ne sont
+    # JAMAIS exécutées — leur coût par session est estimé à 2 × latence.
+    bdd_rtt = None
+    if args.send_mistral and not args.mistral_offline:
+        print(f"\n[1bis] Backend BDD ({mistral_uploader.BACKEND_URL}) — lecture seule, aucune écriture")
+        t0 = time.monotonic()
+        delivered = mistral_uploader.fetch_delivered_folders(mistral_uploader.MISTRAL_CLIENT_ID)
+        fetch_s = time.monotonic() - t0
+        print(f"    GET delivered-folders (1× au démarrage du run) : {fetch_s:6.2f} s"
+              f"  ({len(delivered)} dossier(s) déjà livré(s))")
+        rtts = []
+        logging.disable(logging.WARNING)  # le client_id sonde peut répondre vide/erreur : sans intérêt ici
+        try:
+            for _ in range(5):
+                t0 = time.monotonic()
+                mistral_uploader._fetch_delivered_folders("speedtest-probe")
+                rtts.append(time.monotonic() - t0)
+        finally:
+            logging.disable(logging.NOTSET)
+        rtts.sort()
+        bdd_rtt = rtts[len(rtts) // 2]
+        print(f"    Latence backend (GET à vide, médiane sur 5)    : {bdd_rtt * 1000:6.0f} ms")
+        print(f"    Surcoût BDD estimé par session envoyée         : {2 * bdd_rtt:6.2f} s"
+              f"  (2 POST : register-bulk + mark-sent-bulk, estimés — jamais exécutés)")
+
     # ── Chronométrage étape par étape ────────────────────────────────────────
     print(f"\n[2] Temps par étape — {len(sample)} session(s) échantillonnée(s) sur {len(sessions)}"
           f" (1 seul processus, OpenCV 1 thread : comparable à UN worker du pipeline)")
@@ -483,11 +519,21 @@ def main() -> int:
               f"  ({_fmt_rate(read_mbps)} ÷ {avg_bytes / _MB:,.0f} Mo/session)")
 
     if args.send_mistral and "zip" in means and means["zip"] > 0:
-        thr_zip = zip_workers / means["zip"]
-        caps.append(("compression zip (--send-mistral)", thr_zip, "zip"))
+        # Chemin d'envoi par session (thread du move_pool, séquentiel) :
+        # zip → upload (non mesuré) → 2 POST BDD (estimés via la latence sondée).
+        send_cost = means["zip"] + (2 * bdd_rtt if bdd_rtt else 0.0)
+        thr_zip = zip_workers / send_cost
+        if bdd_rtt:
+            cap_name = f"envoi (zip {means['zip']:.2f} s + BDD ~{2 * bdd_rtt:.2f} s par session)"
+            sugg = "bdd" if 2 * bdd_rtt > means["zip"] else "zip"
+        else:
+            cap_name = "compression zip (--send-mistral)"
+            sugg = "zip"
+        caps.append((cap_name, thr_zip, sugg))
         avg_zip = sum(r["zip_bytes"] for r in results if r["zip_bytes"]) / max(1, counts.get("zip", 1))
-        print(f"    Débit zip ({zip_workers} threads) : {thr_zip:6.2f} sessions/s → {n_total / thr_zip / 60:8.1f} min"
-              f"  (zip moyen : {avg_zip / _MB:,.0f} Mo)")
+        bdd_tag = f" + BDD ~{2 * bdd_rtt:.2f} s" if bdd_rtt else ""
+        print(f"    Débit envoi ({zip_workers} threads) : {thr_zip:6.2f} sessions/s → {n_total / thr_zip / 60:8.1f} min"
+              f"  (zip moyen : {avg_zip / _MB:,.0f} Mo{bdd_tag})")
         print(f"    Upload Mistral        : NON MESURÉ (aucun envoi réel) — à {avg_zip / _MB:,.0f} Mo/session,"
               f" comptez (Mo/s de votre lien) ÷ {avg_zip / _MB:,.0f} sessions/s")
 
