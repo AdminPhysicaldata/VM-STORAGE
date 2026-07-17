@@ -139,7 +139,7 @@ import diagnose_shuffle
 import checks  # noqa: E402 — scoring qualité (ex treatment-worker)
 import SessionsToMistral as mistral_uploader  # noqa: E402 — envoi (--send-mistral)
 
-_PIPELINE_VERSION = 9  # bump à chaque changement de sémantique pour invalider le cache existant
+_PIPELINE_VERSION = 10  # bump à chaque changement de sémantique pour invalider le cache existant
 _MARKER_NAME = ".postcheck.json"
 _DEFAULT_WORKERS = os.cpu_count() or 4
 _PROGRESS_EVERY = 200
@@ -368,11 +368,13 @@ def _fingerprint(session_dir: Path) -> str:
 
 
 def _config_key(apply: bool, run_charuco: bool, charuco_sample_fps: float,
-                 run_lr_check: bool, lr_n_samples: int, run_quality: bool) -> str:
+                 run_lr_check: bool, lr_n_samples: int, run_quality: bool,
+                 run_quality_vision: bool) -> str:
     # NB : "apply" n'entre pas dans la clé — un résultat "OK" en dry-run reste
     # valide en mode --apply (rien à appliquer). Voir _process_one pour la
     # logique d'invalidation qui dépend du statut ET de apply.
-    return f"{_PIPELINE_VERSION}:{run_charuco}:{charuco_sample_fps}:{run_lr_check}:{lr_n_samples}:{run_quality}"
+    return (f"{_PIPELINE_VERSION}:{run_charuco}:{charuco_sample_fps}:{run_lr_check}:"
+            f"{lr_n_samples}:{run_quality}:{run_quality_vision}")
 
 
 def _load_cache(session_dir: Path, fingerprint: str, config_key: str) -> dict | None:
@@ -463,13 +465,21 @@ def _process_one(
     run_lr_check: bool = True,
     lr_n_samples: int = 10,
     run_quality: bool = True,
+    run_quality_vision: bool = True,
 ) -> dict:
     """Tout ce qui touche une session, isolé pour tourner dans un worker
     séparé. Ne lève jamais — toute exception est convertie en statut ERROR
     pour ne jamais faire tomber le pool sur une session pourrie."""
+    # IMPORTANT : ce flag doit être (ré)appliqué ICI, dans le worker — depuis
+    # Python 3.14 le start method Linux par défaut est forkserver : les workers
+    # ré-importent les modules et n'héritent PAS d'un checks.ENABLE_VISION posé
+    # dans le parent (_run). Le passer en argument est la seule voie fiable,
+    # quel que soit le start method.
+    checks.ENABLE_VISION = run_quality_vision
     session_dir = Path(session_dir_str)
     name = session_dir.name
-    config_key = _config_key(apply, run_charuco, charuco_sample_fps, run_lr_check, lr_n_samples, run_quality)
+    config_key = _config_key(apply, run_charuco, charuco_sample_fps, run_lr_check, lr_n_samples,
+                             run_quality, run_quality_vision)
 
     try:
         fingerprint = _fingerprint(session_dir)
@@ -830,7 +840,7 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
     run_charuco = not args.skip_charuco
     run_lr_check = not args.skip_lr_check
     run_quality = not args.skip_quality
-    checks.ENABLE_VISION = not args.skip_quality_vision  # cf. checks.py — gripper_tracking/label_inversion
+    run_quality_vision = not args.skip_quality_vision  # propagé aux workers via _process_one (cf. forkserver)
 
     # ── Mode session unique : pas de tableau de bord, juste le résultat ──────
     if args.session:
@@ -838,6 +848,7 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
         result = _process_one(
             str(session_dir), args.apply, run_charuco, args.charuco_sample_fps, force=True,
             run_lr_check=run_lr_check, lr_n_samples=args.lr_n_samples, run_quality=run_quality,
+            run_quality_vision=run_quality_vision,
         )
         _print_result(result, verbose=True)
         return {}, (0 if result["status"] != "ERROR" else 1), {"single": True}
@@ -986,7 +997,7 @@ def _run(stdscr, args) -> tuple[dict, int, dict]:
                 return pool.submit(
                     _process_one, str(s), args.apply, charuco_this_session,
                     args.charuco_sample_fps, args.force,
-                    run_lr_check, args.lr_n_samples, run_quality,
+                    run_lr_check, args.lr_n_samples, run_quality, run_quality_vision,
                 )
 
             def _handle_result(session_dir: Path, result: dict) -> None:
