@@ -46,6 +46,7 @@ Usage :
 from __future__ import annotations
 
 import json
+import logging
 import os
 import sys
 import tempfile
@@ -55,6 +56,10 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import run_pipeline as rp  # noqa: E402 — règle aussi sys.path (sessions-uploader) et l'env
+
+# Les INFO de gripper_tracking (émis pendant le scoring qualité vision)
+# noieraient l'affichage du chronométrage — on ne garde que warnings/erreurs.
+logging.getLogger("gripper_tracking").setLevel(logging.WARNING)
 import fix_camera_names  # noqa: E402
 import verify_camera_sync  # noqa: E402
 import verify_integrity  # noqa: E402

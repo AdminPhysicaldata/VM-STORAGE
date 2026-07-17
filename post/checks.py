@@ -913,7 +913,10 @@ def _compute_quality_score(checks_result: dict, session_path: str) -> dict:
     if analysis:
         pairs = analysis.get("drift_check", {}).get("pairs", {})
         if pairs:
-            max_rel = max(abs(v.get("relative_drift_ms_per_min", 0)) for v in pairs.values())
+            # analysis.json est une donnée externe : une paire peut porter
+            # "relative_drift_ms_per_min": null → .get(clé, 0) renvoie None
+            # (la clé existe), d'où abs(None) — on force le repli sur 0.
+            max_rel = max(abs(v.get("relative_drift_ms_per_min") or 0) for v in pairs.values())
             # 0 ms/min = parfait (100), 10 ms/min = score 50, 20 ms/min = 0
             s["sync_inter_cameras"] = round(max(0.0, 100.0 - max_rel * 5.0), 1)
             _sync_set = True
@@ -944,10 +947,10 @@ def _compute_quality_score(checks_result: dict, session_path: str) -> dict:
     if analysis:
         cams_a = analysis.get("fps_check", {}).get("cameras", {})
         if cams_a:
-            total_est  = sum((c.get("measured_fps", 0) or c.get("expected_fps", 0)) *
-                             c.get("duration_sec", 0) for c in cams_a.values())
-            total_gaps = sum(c.get("sequence_gaps",  0) for c in cams_a.values())
-            total_qdrop = sum(c.get("queue_drops",   0) for c in cams_a.values())
+            total_est  = sum((c.get("measured_fps") or c.get("expected_fps") or 0) *
+                             (c.get("duration_sec") or 0) for c in cams_a.values())
+            total_gaps = sum(c.get("sequence_gaps") or 0 for c in cams_a.values())
+            total_qdrop = sum(c.get("queue_drops") or 0 for c in cams_a.values())
             gap_pct     = total_gaps / total_est * 100.0 if total_est > 0 else 0.0
             kernel_score = max(0.0, 100.0 - gap_pct * 2.0 - total_qdrop * 5.0)
             s["video_stability"] = round(0.45 * drop_score + 0.25 * std_score + 0.30 * kernel_score, 1)
