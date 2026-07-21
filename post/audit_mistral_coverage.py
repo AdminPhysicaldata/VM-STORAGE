@@ -41,6 +41,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import sys
 import time
 from collections import defaultdict
@@ -49,7 +50,15 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent / "sessions-uploader"))
 import SessionsToMistral as mistral_uploader  # noqa: E402
 
-SESSION_PREFIX = "session_"
+# Un vrai dossier de session est nommé session_YYYYMMDD_HHMMSS(...). Un simple
+# startswith("session_") mord aussi sur des dossiers CONTENEURS qui partagent
+# le préfixe par coïncidence (ex. "session_envoye", le dossier singulier créé
+# par move_session_to_sent — à ne pas confondre avec "sessions_envoyes",
+# pluriel, qui lui ne matche pas le préfixe) : un tel dossier serait alors pris
+# pour UNE SEULE session géante au lieu d'être parcouru, et son contenu réel
+# jamais vu. D'où l'ancrage sur le format de date, identique à
+# SessionsToMistral._SESSION_DATE_RE.
+SESSION_NAME_RE = re.compile(r"^session_\d{8}_\d{6}", re.IGNORECASE)
 DODGE_FILE = mistral_uploader.DODGE_FILE  # "uploaded_sessions.json"
 
 
@@ -79,14 +88,14 @@ def scan_bucket(bucket_path: Path, dodge_paths: list) -> list[tuple[str, str, in
     même inclus s'il s'agit directement d'une session). Empile aussi tout
     fichier uploaded_sessions.json croisé en route dans dodge_paths.
     """
-    if bucket_path.name.startswith(SESSION_PREFIX):
+    if SESSION_NAME_RE.match(bucket_path.name):
         return [(str(bucket_path), bucket_path.name, _session_size(str(bucket_path)))]
 
     results: list[tuple[str, str, int]] = []
     for dirpath, dirnames, filenames in os.walk(bucket_path):
         keep = []
         for d in dirnames:
-            if d.startswith(SESSION_PREFIX):
+            if SESSION_NAME_RE.match(d):
                 sdir = os.path.join(dirpath, d)
                 results.append((sdir, d, _session_size(sdir)))
             else:
@@ -190,7 +199,7 @@ def main() -> int:
         for c in children:
             if not c.is_dir():
                 continue
-            if c.name.startswith(SESSION_PREFIX):
+            if SESSION_NAME_RE.match(c.name):
                 buckets["(racine)"].append(c)
             else:
                 buckets[c.name].append(c)
